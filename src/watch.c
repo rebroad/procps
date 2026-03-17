@@ -134,6 +134,7 @@ static int ansi_fade_max_brightness = 255;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
+static size_t utf8_seq_len(unsigned char c);
 
 typedef uf64 watch_usec_t;
 #define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
@@ -443,6 +444,10 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 			continue;
 		}
 
+		size_t seq = utf8_seq_len((unsigned char)line[i]);
+		if (seq > 1 && i + seq > len)
+			seq = 1;
+
 		bool highlight = false;
 		int intensity = 0;
 		if (vis < age_len && ages) {
@@ -462,22 +467,29 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 			int g = 200 * intensity / 255;
 			int b = 0;
 			int blen = snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", r, g, b);
-			if (o + (size_t)blen + 8 >= cap) {
+			if (o + (size_t)blen + seq + 8 >= cap) {
 				cap *= 2;
 				out = xrealloc(out, cap);
 			}
 			memcpy(out + o, bg, (size_t)blen);
 			o += (size_t)blen;
-			out[o++] = line[i];
+			memcpy(out + o, line + i, seq);
+			o += seq;
 			out[o++] = '\x1b';
 			out[o++] = '[';
 			out[o++] = '4';
 			out[o++] = '9';
 			out[o++] = 'm';
 		} else {
-			out[o++] = line[i];
+			if (o + seq + 1 >= cap) {
+				cap *= 2;
+				out = xrealloc(out, cap);
+			}
+			memcpy(out + o, line + i, seq);
+			o += seq;
 		}
-		vis++;
+		vis += seq;
+		i += seq - 1;
 		if (o + 32 >= cap) {
 			cap *= 2;
 			out = xrealloc(out, cap);
@@ -485,6 +497,19 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 	}
 	out[o] = '\0';
 	return out;
+}
+
+static size_t utf8_seq_len(unsigned char c)
+{
+	if (c < 0x80)
+		return 1;
+	if ((c & 0xE0) == 0xC0)
+		return 2;
+	if ((c & 0xF0) == 0xE0)
+		return 3;
+	if ((c & 0xF8) == 0xF0)
+		return 4;
+	return 1;
 }
 
 static bool ansi_has_active_fade(void)
