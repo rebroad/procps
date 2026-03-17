@@ -1,0 +1,27 @@
+#!/bin/bash
+blocks=( "🬀" "🬁" "🬂" "🬃" "🬄" "🬅" "🬆" "🬇" "🬈" "🬉" "🬊" "🬋" "🬌" "🬍" "🬎" "🬏" "🬐" "🬑" "🬒" "🬓" "▌" "🬔" "🬕" "🬖" "🬗" "🬘" "🬙" "🬚" "🬛" "🬜" "🬝" "🬞" "🬟" "🬠" "🬡" "🬢" "🬣" "🬤" "🬥" "🬦" "🬧" "▐" "🬨" "🬩" "🬪" "🬫" "🬬" "🬭" "🬮" "🬯" "🬰" "🬱" "🬲" "🬳" "🬴" "🬵" "🬶" "🬷" "🬸" "🬹" "🬺" "🬻" "█" )
+len=${#blocks[@]}
+change_pos=$((RANDOM % 80))
+for i in $(seq 0 79); do
+  r=$((i*255/79))
+  g=$((255 - r))
+  b=$((i*255/79))
+  base_index=$((i % len))
+  ch=${blocks[$base_index]}
+  if [ "$i" -eq "$change_pos" ]; then
+    new_index=$base_index
+    while [ "$new_index" -eq "$base_index" ]; do
+      new_index=$((RANDOM % len))
+    done
+    ch=${blocks[$new_index]}
+  fi
+  printf "\x1b[38;2;%d;%d;%dm%s" "$r" "$g" "$b" "$ch"
+done
+printf "\x1b[0m\n"
+for i in $(seq 0 25); do
+  r=$((i*255/25))
+  g=80
+  b=$((255 - r))
+  printf "\x1b[38;2;%d;%d;%dm%c " "$r" "$g" "$b" "$((65 + i))"
+done
+printf "\x1b[0m$(date)\n"
