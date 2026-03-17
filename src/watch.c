@@ -46,6 +46,7 @@
 #include <inttypes.h>
 #include <locale.h>
 #include <signal.h>
+#include <math.h>
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
@@ -125,6 +126,9 @@ static uint8_t **ansi_char_age;
 static size_t *ansi_char_age_len;
 static int ansi_fade_cycles = 8;
 static int ansi_fade_fps = 12;
+static int ansi_fade_seconds = 0;
+static bool ansi_fade_half_life = false;
+static int ansi_fade_half_life_frames = 0;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
@@ -442,7 +446,12 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 		if (vis < age_len && ages) {
 			if (ages[vis] < (uint8_t)fade_cycles) {
 				highlight = true;
-				intensity = (fade_cycles - ages[vis]) * 255 / fade_cycles;
+				if (ansi_fade_half_life && ansi_fade_half_life_frames > 0) {
+					double ratio = pow(0.5, (double)ages[vis] / (double)ansi_fade_half_life_frames);
+					intensity = (int)(ratio * 255.0);
+				} else {
+					intensity = (fade_cycles - ages[vis]) * 255 / fade_cycles;
+				}
 			}
 		}
 		if (highlight) {
@@ -1771,13 +1780,28 @@ int main(int argc, char *argv[])
 		if (fade_env && *fade_env) {
 			long v = strtol(fade_env, NULL, 10);
 			if (v > 0 && v < 1000)
-				ansi_fade_cycles = (int)v;
+				ansi_fade_seconds = (int)v;
+		}
+		const char *half_env = getenv("WATCH_DIFF_HALF_LIFE");
+		if (half_env && *half_env) {
+			if (strcmp(half_env, "1") == 0 || strcasecmp(half_env, "true") == 0)
+				ansi_fade_half_life = true;
 		}
 		const char *fps_env = getenv("WATCH_DIFF_FPS");
 		if (fps_env && *fps_env) {
 			long v = strtol(fps_env, NULL, 10);
 			if (v > 0 && v <= 60)
 				ansi_fade_fps = (int)v;
+		}
+		if (ansi_fade_seconds > 0) {
+			if (ansi_fade_half_life) {
+				ansi_fade_half_life_frames = ansi_fade_seconds * ansi_fade_fps;
+				if (ansi_fade_half_life_frames < 1)
+					ansi_fade_half_life_frames = 1;
+				ansi_fade_cycles = ansi_fade_half_life_frames * 6;
+			} else {
+				ansi_fade_cycles = ansi_fade_seconds * ansi_fade_fps;
+			}
 		}
 	}
 	command_argv = argv + optind;  // for exec*()
@@ -1846,8 +1870,8 @@ int main(int argc, char *argv[])
 		curs_set(0);
 	}
 
+	watch_usec_t next_render = 0;
 	while (1) {
-		watch_usec_t next_render = 0;
 		if (use_ansi) {
 			char **lines = NULL;
 			int line_count = 0;
@@ -2029,6 +2053,8 @@ int main(int argc, char *argv[])
 				watch_usec_t remaining = interval - t;
 				if (use_ansi && (flags & WATCH_DIFF) && !(flags & WATCH_CUMUL) && ansi_has_active_fade()) {
 					watch_usec_t now = get_time_usec();
+					if (next_render == 0)
+						next_render = now + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
 					if (now < next_render) {
 						watch_usec_t until_render = next_render - now;
 						if (until_render < remaining)
@@ -2070,17 +2096,26 @@ int main(int argc, char *argv[])
 			}
 			if (use_ansi && (flags & WATCH_DIFF) && !(flags & WATCH_CUMUL)) {
 				watch_usec_t now = get_time_usec();
-				if (now >= next_render && ansi_has_active_fade()) {
-					for (int row = 0; row < ansi_prev_count; row++) {
-						if (!ansi_char_age[row])
-							continue;
-						for (size_t i2 = 0; i2 < ansi_char_age_len[row]; i2++) {
-							if (ansi_char_age[row][i2] < (uint8_t)ansi_fade_cycles)
-								ansi_char_age[row][i2]++;
-						}
+				if (ansi_has_active_fade()) {
+					if (next_render == 0)
+						next_render = now + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
+					if (now >= next_render) {
+						watch_usec_t frame = USECS_PER_SEC / (watch_usec_t)ansi_fade_fps;
+						do {
+							for (int row = 0; row < ansi_prev_count; row++) {
+								if (!ansi_char_age[row])
+									continue;
+								for (size_t i2 = 0; i2 < ansi_char_age_len[row]; i2++) {
+									if (ansi_char_age[row][i2] < (uint8_t)ansi_fade_cycles)
+										ansi_char_age[row][i2]++;
+								}
+							}
+							next_render += frame;
+						} while (now >= next_render);
+						ansi_render_current((flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT);
 					}
-					ansi_render_current((flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT);
-					next_render = now + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
+				} else {
+					next_render = 0;
 				}
 			}
 		} while (i);
