@@ -135,6 +135,7 @@ static int ansi_fade_max_brightness = 255;
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
 static size_t utf8_seq_len(unsigned char c);
+static size_t utf8_count_glyphs(const char *s);
 
 typedef uf64 watch_usec_t;
 #define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
@@ -488,7 +489,7 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 			memcpy(out + o, line + i, seq);
 			o += seq;
 		}
-		vis += seq;
+		vis++;
 		i += seq - 1;
 		if (o + 32 >= cap) {
 			cap *= 2;
@@ -510,6 +511,22 @@ static size_t utf8_seq_len(unsigned char c)
 	if ((c & 0xF8) == 0xF0)
 		return 4;
 	return 1;
+}
+
+static size_t utf8_count_glyphs(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	size_t count = 0;
+	size_t len = strlen(s);
+	for (size_t i = 0; i < len; ) {
+		size_t seq = utf8_seq_len((unsigned char)s[i]);
+		if (seq > 1 && i + seq > len)
+			seq = 1;
+		i += seq;
+		count++;
+	}
+	return count;
 }
 
 static bool ansi_has_active_fade(void)
@@ -1951,35 +1968,59 @@ int main(int argc, char *argv[])
 					if ((flags & WATCH_ALL_DIFF) && have_prev && changed)
 						screen_changed = true;
 
-					uint8_t *new_ages = xcalloc(plen, 1);
+					size_t glyph_count = utf8_count_glyphs(plain);
+					uint8_t *new_ages = xcalloc(glyph_count, 1);
 					if (flags & WATCH_DIFF) {
 						if (!have_prev) {
-							for (size_t i = 0; i < plen; i++)
+							for (size_t i = 0; i < glyph_count; i++)
 								new_ages[i] = (uint8_t)ansi_fade_cycles;
-						} else
-						for (size_t i = 0; i < plen; i++) {
-							bool ch = (i >= prev_len) || (ansi_prev_plain[row] && plain[i] != ansi_prev_plain[row][i]);
-							if (ch) {
-								new_ages[i] = 0;
-							} else if (ansi_char_age[row] && i < ansi_char_age_len[row]) {
-								uint8_t prev_age = ansi_char_age[row][i];
-								if (flags & WATCH_CUMUL) {
-									new_ages[i] = prev_age == 0 ? 0 : (uint8_t)ansi_fade_cycles;
+						} else {
+							size_t i = 0;
+							size_t pi = 0;
+							size_t g = 0;
+							while (i < plen && g < glyph_count) {
+								size_t seq = utf8_seq_len((unsigned char)plain[i]);
+								if (seq > 1 && i + seq > plen)
+									seq = 1;
+								bool ch = false;
+								size_t pseq = 0;
+								if (!ansi_prev_plain[row] || pi >= prev_len) {
+									ch = true;
 								} else {
-									new_ages[i] = prev_age < (uint8_t)ansi_fade_cycles ? (uint8_t)(prev_age + 1) : (uint8_t)ansi_fade_cycles;
+									pseq = utf8_seq_len((unsigned char)ansi_prev_plain[row][pi]);
+									if (pseq > 1 && pi + pseq > prev_len)
+										pseq = 1;
+									if (seq != pseq || memcmp(plain + i, ansi_prev_plain[row] + pi, seq) != 0)
+										ch = true;
 								}
-							} else {
-								new_ages[i] = (uint8_t)ansi_fade_cycles;
+								if (ch) {
+									new_ages[g] = 0;
+								} else if (ansi_char_age[row] && g < ansi_char_age_len[row]) {
+									uint8_t prev_age = ansi_char_age[row][g];
+									if (flags & WATCH_CUMUL) {
+										new_ages[g] = prev_age == 0 ? 0 : (uint8_t)ansi_fade_cycles;
+									} else {
+										new_ages[g] = prev_age < (uint8_t)ansi_fade_cycles ? (uint8_t)(prev_age + 1) : (uint8_t)ansi_fade_cycles;
+									}
+								} else {
+									new_ages[g] = (uint8_t)ansi_fade_cycles;
+								}
+								i += seq;
+								if (!ch && pseq > 0)
+									pi += pseq;
+								else if (pi < prev_len && pseq > 0)
+									pi += pseq;
+								g++;
 							}
 						}
 					} else {
-						for (size_t i = 0; i < plen; i++)
+						for (size_t i = 0; i < glyph_count; i++)
 							new_ages[i] = (uint8_t)ansi_fade_cycles;
 					}
 
 					char *out_line = NULL;
 					if (flags & WATCH_DIFF)
-						out_line = ansi_apply_char_diff(line, new_ages, plen, ansi_fade_cycles);
+						out_line = ansi_apply_char_diff(line, new_ages, glyph_count, ansi_fade_cycles);
 					else
 						out_line = xstrdup(line);
 
@@ -1992,7 +2033,7 @@ int main(int argc, char *argv[])
 					ansi_prev_lines[row] = xstrdup(line);
 					ansi_prev_plain[row] = plain;
 					ansi_char_age[row] = new_ages;
-					ansi_char_age_len[row] = plen;
+					ansi_char_age_len[row] = glyph_count;
 				}
 
 				next_render = get_time_usec() + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
