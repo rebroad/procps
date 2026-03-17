@@ -1851,6 +1851,7 @@ int main(int argc, char *argv[])
 		if (use_ansi) {
 			char **lines = NULL;
 			int line_count = 0;
+			bool run_now = true;
 			screen_changed = false;
 			if (screen_size_changed) {
 				screen_size_changed = false;
@@ -1858,80 +1859,88 @@ int main(int argc, char *argv[])
 				ansi_reset_prev_buffers(MAIN_HEIGHT);
 				first_screen = true;
 			}
-			ansi_move(0, 0);
-			t = get_time_usec();
-			if (flags & WATCH_PRECISE)
-				last_tick = t;
-			cmdexit = run_command_ansi(&lines, MAIN_HEIGHT, &line_count);
-			if (flags & WATCH_PRECISE)
-				ansi_output_headers(get_time_usec() - t, cmdexit);
-			else {
-				last_tick = get_time_usec();
-				ansi_output_headers(last_tick - t, cmdexit);
+			if (!first_screen && !screen_size_changed) {
+				watch_usec_t elapsed = get_time_usec() - last_tick;
+				if (elapsed < interval)
+					run_now = false;
 			}
-
-			int start_row = (flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT;
-			for (int row = 0; row < MAIN_HEIGHT; row++) {
-				const char *line = (row < line_count && lines[row]) ? lines[row] : "";
-				char *plain = strip_ansi_sgr(line);
-				bool changed = true;
-				size_t plen = strlen(plain);
-				size_t prev_len = ansi_prev_plain[row] ? strlen(ansi_prev_plain[row]) : 0;
-				bool have_prev = (!first_screen && ansi_prev_plain[row]);
-				if (have_prev) {
-					changed = strcmp(plain, ansi_prev_plain[row]) != 0;
+			if (run_now) {
+				ansi_move(0, 0);
+				t = get_time_usec();
+				if (flags & WATCH_PRECISE)
+					last_tick = t;
+				cmdexit = run_command_ansi(&lines, MAIN_HEIGHT, &line_count);
+				if (flags & WATCH_PRECISE)
+					ansi_output_headers(get_time_usec() - t, cmdexit);
+				else {
+					last_tick = get_time_usec();
+					ansi_output_headers(last_tick - t, cmdexit);
 				}
-				if ((flags & WATCH_ALL_DIFF) && have_prev && changed)
-					screen_changed = true;
 
-				uint8_t *new_ages = xcalloc(plen, 1);
-				if (flags & WATCH_DIFF) {
-					if (!have_prev) {
+				int start_row = (flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT;
+				for (int row = 0; row < MAIN_HEIGHT; row++) {
+					const char *line = (row < line_count && lines[row]) ? lines[row] : "";
+					char *plain = strip_ansi_sgr(line);
+					bool changed = true;
+					size_t plen = strlen(plain);
+					size_t prev_len = ansi_prev_plain[row] ? strlen(ansi_prev_plain[row]) : 0;
+					bool have_prev = (!first_screen && ansi_prev_plain[row]);
+					if (have_prev) {
+						changed = strcmp(plain, ansi_prev_plain[row]) != 0;
+					}
+					if ((flags & WATCH_ALL_DIFF) && have_prev && changed)
+						screen_changed = true;
+
+					uint8_t *new_ages = xcalloc(plen, 1);
+					if (flags & WATCH_DIFF) {
+						if (!have_prev) {
+							for (size_t i = 0; i < plen; i++)
+								new_ages[i] = (uint8_t)ansi_fade_cycles;
+						} else
+						for (size_t i = 0; i < plen; i++) {
+							bool ch = (i >= prev_len) || (ansi_prev_plain[row] && plain[i] != ansi_prev_plain[row][i]);
+							if (ch) {
+								new_ages[i] = 0;
+							} else if (ansi_char_age[row] && i < ansi_char_age_len[row]) {
+								uint8_t prev_age = ansi_char_age[row][i];
+								if (flags & WATCH_CUMUL) {
+									new_ages[i] = prev_age == 0 ? 0 : (uint8_t)ansi_fade_cycles;
+								} else {
+									new_ages[i] = prev_age < (uint8_t)ansi_fade_cycles ? (uint8_t)(prev_age + 1) : (uint8_t)ansi_fade_cycles;
+								}
+							} else {
+								new_ages[i] = (uint8_t)ansi_fade_cycles;
+							}
+						}
+					} else {
 						for (size_t i = 0; i < plen; i++)
 							new_ages[i] = (uint8_t)ansi_fade_cycles;
-					} else
-					for (size_t i = 0; i < plen; i++) {
-						bool ch = (i >= prev_len) || (ansi_prev_plain[row] && plain[i] != ansi_prev_plain[row][i]);
-						if (ch) {
-							new_ages[i] = 0;
-						} else if (ansi_char_age[row] && i < ansi_char_age_len[row]) {
-							uint8_t prev_age = ansi_char_age[row][i];
-							if (flags & WATCH_CUMUL) {
-								new_ages[i] = prev_age == 0 ? 0 : (uint8_t)ansi_fade_cycles;
-							} else {
-								new_ages[i] = prev_age < (uint8_t)ansi_fade_cycles ? (uint8_t)(prev_age + 1) : (uint8_t)ansi_fade_cycles;
-							}
-						} else {
-							new_ages[i] = (uint8_t)ansi_fade_cycles;
-						}
 					}
-				} else {
-					for (size_t i = 0; i < plen; i++)
-						new_ages[i] = (uint8_t)ansi_fade_cycles;
+
+					char *out_line = NULL;
+					if (flags & WATCH_DIFF)
+						out_line = ansi_apply_char_diff(line, new_ages, plen, ansi_fade_cycles);
+					else
+						out_line = xstrdup(line);
+
+					ansi_write_line(start_row + row, out_line);
+					free(out_line);
+
+					free(ansi_prev_lines[row]);
+					free(ansi_prev_plain[row]);
+					free(ansi_char_age[row]);
+					ansi_prev_lines[row] = xstrdup(line);
+					ansi_prev_plain[row] = plain;
+					ansi_char_age[row] = new_ages;
+					ansi_char_age_len[row] = plen;
 				}
 
-				char *out_line = NULL;
-				if (flags & WATCH_DIFF)
-					out_line = ansi_apply_char_diff(line, new_ages, plen, ansi_fade_cycles);
-				else
-					out_line = xstrdup(line);
+				next_render = get_time_usec() + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
 
-				ansi_write_line(start_row + row, out_line);
-				free(out_line);
-
-				free(ansi_prev_lines[row]);
-				free(ansi_prev_plain[row]);
-				free(ansi_char_age[row]);
-				ansi_prev_lines[row] = xstrdup(line);
-				ansi_prev_plain[row] = plain;
-				ansi_char_age[row] = new_ages;
-				ansi_char_age_len[row] = plen;
+				for (int i2 = 0; i2 < line_count; i2++)
+					free(lines[i2]);
+				free(lines);
 			}
-
-			next_render = get_time_usec() + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
-			for (int i2 = 0; i2 < line_count; i2++)
-				free(lines[i2]);
-			free(lines);
 
 			if (cmdexit && (flags & WATCH_BEEP))
 				(void)!write(STDOUT_FILENO, "\a", 1);
