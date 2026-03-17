@@ -114,6 +114,8 @@ static bool use_pty;
 static bool use_ansi;
 static bool termios_active;
 static struct termios termios_orig;
+static bool color_option_seen;
+static bool color_explicit;
 static char **ansi_prev_lines;
 static char **ansi_prev_plain;
 static int *ansi_line_age;
@@ -224,7 +226,9 @@ static void setup_terminal_raw(void)
 	if (tcgetattr(STDIN_FILENO, &termios_orig) == 0) {
 		termios_active = true;
 		t = termios_orig;
-		cfmakeraw(&t);
+		t.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+		t.c_cc[VMIN] = 1;
+		t.c_cc[VTIME] = 0;
 		tcsetattr(STDIN_FILENO, TCSANOW, &t);
 		atexit(restore_terminal);
 	}
@@ -420,7 +424,7 @@ static void ansi_reset_prev_buffers(int count)
 	ansi_prev_count = count;
 }
 
-static char **ansi_read_lines(FILE *p, int *out_count)
+static char **ansi_read_lines(FILE *p, int max_lines, int *out_count)
 {
 	size_t cap = 8192;
 	size_t len = 0;
@@ -438,12 +442,22 @@ static char **ansi_read_lines(FILE *p, int *out_count)
 	}
 	buf[len] = '\0';
 
-	for (size_t i = 0; i < len; i++) {
-		if (buf[i] == '\r')
-			buf[i] = '\n';
+	if (len > 0) {
+		size_t w = 0;
+		for (size_t r = 0; r < len; r++) {
+			if (buf[r] == '\r') {
+				if (r + 1 < len && buf[r + 1] == '\n') {
+					continue;
+				}
+				buf[w++] = '\n';
+				continue;
+			}
+			buf[w++] = buf[r];
+		}
+		buf[w] = '\0';
+		len = w;
 	}
 
-	int max_lines = MAIN_HEIGHT;
 	char **lines = xcalloc((size_t)max_lines, sizeof(*lines));
 	int count = 0;
 	size_t start = 0;
@@ -1283,9 +1297,9 @@ static uint8_t run_command(void)
 	if (child == 0) {  /* in child */
 		// stdout/err can't be used here. Avoid xerr(), close_stdout(), ...
 		// fclose() so as not to confuse _Exit().
-		fclose(stdout);
-		fclose(stderr);
 		if (!use_pty) {
+			fclose(stdout);
+			fclose(stderr);
 			// connect out and err up with pipe input
 			while (close(pipefd[0]) == -1 && errno == EINTR) ;
 			while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
@@ -1445,7 +1459,7 @@ static uint8_t run_command(void)
 	return 0x80 + (WTERMSIG(status) & 0x7f);
 }
 
-static uint8_t run_command_ansi(char ***out_lines, int *out_count)
+static uint8_t run_command_ansi(char ***out_lines, int max_lines, int *out_count)
 {
 	int pipefd[2], status;
 	int outfd;
@@ -1471,9 +1485,9 @@ static uint8_t run_command_ansi(char ***out_lines, int *out_count)
 	}
 
 	if (child == 0) {
-		fclose(stdout);
-		fclose(stderr);
 		if (!use_pty) {
+			fclose(stdout);
+			fclose(stderr);
 			while (close(pipefd[0]) == -1 && errno == EINTR) ;
 			while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
 			while (close(pipefd[1]) == -1 && errno == EINTR) ;
@@ -1506,7 +1520,7 @@ static uint8_t run_command_ansi(char ***out_lines, int *out_count)
 	if (!p)
 		err(2, _("fdopen"));
 	setvbuf(p, NULL, _IOFBF, BUFSIZ);
-	*out_lines = ansi_read_lines(p, out_count);
+	*out_lines = ansi_read_lines(p, max_lines, out_count);
 	fclose(p);
 
 	while (waitpid(child, &status, 0) == -1) {
@@ -1581,9 +1595,13 @@ int main(int argc, char *argv[])
 			break;
 		case 'c':
 			flags |= WATCH_COLOR;
+			color_option_seen = true;
+			color_explicit = true;
 			break;
 		case 'C':
 			flags &= ~WATCH_COLOR;
+			color_option_seen = true;
+			color_explicit = false;
 			break;
 		case 'd':
 			flags |= WATCH_DIFF;
@@ -1645,7 +1663,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, _("Follow -f option conflicts with change options -d,-e or -q"));
             usage(stderr);
         }
-	use_ansi = (flags & WATCH_COLOR);
+	use_ansi = color_option_seen && color_explicit && (flags & WATCH_COLOR);
 	use_pty = (flags & WATCH_COLOR);
 	command_argv = argv + optind;  // for exec*()
 	command_len = strlen(argv[optind]);
@@ -1686,7 +1704,11 @@ int main(int argc, char *argv[])
 		setvbuf(stdout, NULL, _IONBF, 0);
 		ansi_hide_cursor();
 		ansi_get_winsize();
-		ansi_reset_prev_buffers(MAIN_HEIGHT);
+		{
+			int header_pad = (flags & WATCH_NOTITLE) ? 0 : 1;
+			int ansi_main_height = MAIN_HEIGHT - header_pad;
+			ansi_reset_prev_buffers(ansi_main_height);
+		}
 	} else {
 		/* Set up tty for curses use.  */
 		initscr();  // succeeds or exit()s, may install sig handlers
@@ -1718,18 +1740,22 @@ int main(int argc, char *argv[])
 			char **lines = NULL;
 			int line_count = 0;
 			const int fade_cycles = 8;
+			int header_pad = (flags & WATCH_NOTITLE) ? 0 : 1;
+			int ansi_main_height = MAIN_HEIGHT - header_pad;
 			screen_changed = false;
 			if (screen_size_changed) {
 				screen_size_changed = false;
 				ansi_get_winsize();
-				ansi_reset_prev_buffers(MAIN_HEIGHT);
+				header_pad = (flags & WATCH_NOTITLE) ? 0 : 1;
+				ansi_main_height = MAIN_HEIGHT - header_pad;
+				ansi_reset_prev_buffers(ansi_main_height);
 				first_screen = true;
 			}
 			ansi_clear_screen();
 			t = get_time_usec();
 			if (flags & WATCH_PRECISE)
 				last_tick = t;
-			cmdexit = run_command_ansi(&lines, &line_count);
+			cmdexit = run_command_ansi(&lines, ansi_main_height, &line_count);
 			if (flags & WATCH_PRECISE)
 				ansi_output_headers(get_time_usec() - t, cmdexit);
 			else {
@@ -1737,8 +1763,8 @@ int main(int argc, char *argv[])
 				ansi_output_headers(last_tick - t, cmdexit);
 			}
 
-			int start_row = (flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT;
-			for (int row = 0; row < MAIN_HEIGHT; row++) {
+			int start_row = (flags & WATCH_NOTITLE) ? 0 : (HEADER_HEIGHT + 1);
+			for (int row = 0; row < ansi_main_height; row++) {
 				const char *line = (row < line_count && lines[row]) ? lines[row] : "";
 				char *plain = strip_ansi_sgr(line);
 				bool changed = true;
@@ -1750,7 +1776,10 @@ int main(int argc, char *argv[])
 						screen_changed = true;
 				}
 				if (flags & WATCH_DIFF) {
-					if (changed) {
+					if (first_screen) {
+						ansi_line_age[row] = fade_cycles;
+						ansi_line_seen[row] = false;
+					} else if (changed) {
 						ansi_line_age[row] = 0;
 						ansi_line_seen[row] = true;
 					} else if (! (flags & WATCH_CUMUL)) {
