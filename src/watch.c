@@ -1790,7 +1790,7 @@ int main(int argc, char *argv[])
 			if (v > 0 && v < 1000)
 				ansi_half_life_seconds = (int)v;
 		}
-		const char *fps_env = getenv("WATCH_DIFF_FPS");
+		const char *fps_env = getenv("WATCH_FPS");
 		if (fps_env && *fps_env) {
 			long v = strtol(fps_env, NULL, 10);
 			if (v > 0 && v <= 60)
