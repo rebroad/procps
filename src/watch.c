@@ -46,9 +46,11 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <locale.h>
+#include <wchar.h>
 #include <signal.h>
 #include <math.h>
 #include <strings.h>
+#include <pwd.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -118,23 +120,33 @@ static bool termios_active;
 static struct termios termios_orig;
 static bool color_option_seen;
 static bool color_explicit;
+static volatile sig_atomic_t ansi_exit_newline = 0;
 static char **ansi_prev_lines;
 static char **ansi_prev_plain;
 static int *ansi_line_age;
 static bool *ansi_line_seen;
 static int ansi_prev_count;
-static uint8_t **ansi_char_age;
+static int16_t **ansi_char_age;
 static size_t *ansi_char_age_len;
 static int ansi_fade_cycles = 8;
 static int ansi_fade_fps = 12;
-static int ansi_fade_seconds = 0;
-static int ansi_half_life_seconds = 0;
+static double ansi_fade_seconds = 1.0;
 static bool ansi_fade_half_life = false;
 static int ansi_fade_half_life_frames = 0;
 static int ansi_fade_max_brightness = 255;
 static int ansi_fade_bg_r = 255;
 static int ansi_fade_bg_g = 200;
 static int ansi_fade_bg_b = 0;
+static double ansi_fade_in_seconds = 0.0;
+static int ansi_fade_in_frames = 0;
+static bool ansi_default_fg_valid = false;
+static int ansi_default_fg_r = 0;
+static int ansi_default_fg_g = 0;
+static int ansi_default_fg_b = 0;
+static bool ansi_default_bg_valid = false;
+static int ansi_default_bg_r = 0;
+static int ansi_default_bg_g = 0;
+static int ansi_default_bg_b = 0;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
@@ -144,6 +156,13 @@ static bool parse_rgb_env(const char *value, int *r, int *g, int *b);
 static void xterm256_to_rgb(int n, int *r, int *g, int *b);
 static void ansi_update_fg_from_sgr(const char *seq, size_t len, bool *fg_set, int *fr, int *fg, int *fb);
 static void load_watch_prefs(void);
+static char *ansi_truncate_visible(const char *line, int cols);
+static void load_default_fg_from_env(void);
+static void query_default_fg(void);
+static void query_default_bg(void);
+static bool parse_rgb_response(const char *rgb, int *r, int *g, int *b);
+static void log_watch_debug(const char *label, int r, int g, int b, bool ok);
+static void log_watch_settings(void);
 
 typedef uf64 watch_usec_t;
 #define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
@@ -193,6 +212,8 @@ static void __attribute__ ((__noreturn__)) usage(FILE * out)
 static void die(int notused __attribute__ ((__unused__)))
 {
 	if (use_ansi) {
+		ansi_exit_newline = 1;
+		(void)!write(STDOUT_FILENO, "\n", 1);
 		ansi_show_cursor();
 		restore_terminal();
 		exit(EXIT_SUCCESS);
@@ -314,8 +335,17 @@ static void ansi_get_winsize(void)
 static void ansi_write_line(int row, const char *line)
 {
 	ansi_move(row, 0);
-	if (line && *line)
-		(void)!write(STDOUT_FILENO, line, strlen(line));
+	if (line && *line) {
+		char *trunc = NULL;
+		if (width > 0)
+			trunc = ansi_truncate_visible(line, width);
+		if (trunc) {
+			(void)!write(STDOUT_FILENO, trunc, strlen(trunc));
+			free(trunc);
+		} else {
+			(void)!write(STDOUT_FILENO, line, strlen(line));
+		}
+	}
 	(void)!write(STDOUT_FILENO, "\x1b[K", 3); // clear to end of line
 }
 
@@ -428,7 +458,7 @@ static char *ansi_apply_background(const char *line, const char *bg)
 	return out;
 }
 
-static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t age_len, int fade_cycles)
+static char *ansi_apply_char_diff(const char *line, const int16_t *ages, size_t age_len, int fade_cycles)
 {
 	if (!line || !*line)
 		return xstrdup("");
@@ -467,13 +497,21 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 		bool highlight = false;
 		int intensity = 0;
 		if (vis < age_len && ages) {
-			if (ages[vis] < (uint8_t)fade_cycles) {
+			int16_t age = ages[vis];
+			if (age < fade_cycles) {
 				highlight = true;
-				if (ansi_fade_half_life && ansi_fade_half_life_frames > 0) {
-					double ratio = pow(0.5, (double)ages[vis] / (double)ansi_fade_half_life_frames);
+				if (age < 0 && ansi_fade_in_frames > 0) {
+					double ratio = (double)(ansi_fade_in_frames + age) / (double)ansi_fade_in_frames;
+					if (ratio < 0.0)
+						ratio = 0.0;
+					if (ratio > 1.0)
+						ratio = 1.0;
+					intensity = (int)(ratio * (double)ansi_fade_max_brightness);
+				} else if (ansi_fade_half_life && ansi_fade_half_life_frames > 0) {
+					double ratio = pow(0.5, (double)age / (double)ansi_fade_half_life_frames);
 					intensity = (int)(ratio * (double)ansi_fade_max_brightness);
 				} else {
-					intensity = (fade_cycles - ages[vis]) * ansi_fade_max_brightness / fade_cycles;
+					intensity = (fade_cycles - age) * ansi_fade_max_brightness / fade_cycles;
 				}
 			}
 		}
@@ -482,23 +520,36 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 			char fg[64];
 			int restore_len = 0;
 			char restore[80];
-			int bg_r = ansi_fade_bg_r * intensity / 255;
-			int bg_g = ansi_fade_bg_g * intensity / 255;
-			int bg_b = ansi_fade_bg_b * intensity / 255;
+			int denom = ansi_fade_max_brightness > 0 ? ansi_fade_max_brightness : 1;
+			double ratio = (double)intensity / (double)denom;
+			if (ratio < 0.0)
+				ratio = 0.0;
+			if (ratio > 1.0)
+				ratio = 1.0;
+			int base_bg_r = ansi_default_bg_valid ? ansi_default_bg_r : 0;
+			int base_bg_g = ansi_default_bg_valid ? ansi_default_bg_g : 0;
+			int base_bg_b = ansi_default_bg_valid ? ansi_default_bg_b : 0;
+			int bg_r = (int)(base_bg_r + (ansi_fade_bg_r - base_bg_r) * ratio + 0.5);
+			int bg_g = (int)(base_bg_g + (ansi_fade_bg_g - base_bg_g) * ratio + 0.5);
+			int bg_b = (int)(base_bg_b + (ansi_fade_bg_b - base_bg_b) * ratio + 0.5);
 			int fg_r_cur = 0;
 			int fg_g_cur = 0;
 			int fg_b_cur = 0;
-			int denom = ansi_fade_max_brightness > 0 ? ansi_fade_max_brightness : 1;
-			int fg_intensity = ansi_fade_max_brightness > 0 ? (ansi_fade_max_brightness - intensity) : 0;
-			if (fg_set) {
-				fg_r_cur = fg_r * fg_intensity / denom;
-				fg_g_cur = fg_g * fg_intensity / denom;
-				fg_b_cur = fg_b * fg_intensity / denom;
-			}
-			if (fg_set)
-				(void)snprintf(fg, sizeof(fg), "\x1b[38;2;%d;%d;%dm", fg_r_cur, fg_g_cur, fg_b_cur);
-			else
-				(void)snprintf(fg, sizeof(fg), "\x1b[30m");
+			double fg_ratio = 1.0 - ratio;
+		if (fg_set) {
+			fg_r_cur = (int)(fg_r * fg_ratio + 0.5);
+			fg_g_cur = (int)(fg_g * fg_ratio + 0.5);
+			fg_b_cur = (int)(fg_b * fg_ratio + 0.5);
+		} else if (ansi_default_fg_valid) {
+			fg_r_cur = (int)(ansi_default_fg_r * fg_ratio + 0.5);
+			fg_g_cur = (int)(ansi_default_fg_g * fg_ratio + 0.5);
+			fg_b_cur = (int)(ansi_default_fg_b * fg_ratio + 0.5);
+		} else {
+			fg_r_cur = 0;
+			fg_g_cur = 0;
+			fg_b_cur = 0;
+		}
+			(void)snprintf(fg, sizeof(fg), "\x1b[38;2;%d;%d;%dm", fg_r_cur, fg_g_cur, fg_b_cur);
 			(void)snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", bg_r, bg_g, bg_b);
 			if (fg_set)
 				restore_len = snprintf(restore, sizeof(restore), "\x1b[38;2;%d;%d;%dm\x1b[49m", fg_r, fg_g, fg_b);
@@ -646,7 +697,7 @@ static void ansi_update_fg_from_sgr(const char *seq, size_t len, bool *fg_set, i
 			if (cur < 0)
 				cur = 0;
 			cur = cur * 10 + (c - '0');
-		} else if (c == ';') {
+		} else if (c == ';' || c == ':') {
 			if (cur < 0)
 				params[pcount++] = 0;
 			else
@@ -698,6 +749,14 @@ static void ansi_update_fg_from_sgr(const char *seq, size_t len, bool *fg_set, i
 static void load_watch_prefs(void)
 {
 	const char *home = getenv("HOME");
+	char homebuf[PATH_MAX];
+	if ((!home || !*home)) {
+		struct passwd *pw = getpwuid(getuid());
+		if (pw && pw->pw_dir) {
+			snprintf(homebuf, sizeof(homebuf), "%s", pw->pw_dir);
+			home = homebuf;
+		}
+	}
 	char path[PATH_MAX];
 	const char *candidates[1];
 	int idx = 0;
@@ -750,13 +809,12 @@ static void load_watch_prefs(void)
 			key += 6;
 
 		if (strcasecmp(key, "fade") == 0) {
-			long v = strtol(val, NULL, 10);
-			if (v > 0 && v < 1000)
-				ansi_fade_seconds = (int)v;
+			double v = strtod(val, NULL);
+			if (v > 0.0 && v < 1000.0)
+				ansi_fade_seconds = v;
 		} else if (strcasecmp(key, "half_life") == 0) {
-			long v = strtol(val, NULL, 10);
-			if (v > 0 && v < 1000)
-				ansi_half_life_seconds = (int)v;
+			if (strcmp(val, "1") == 0 || strcasecmp(val, "true") == 0)
+				ansi_fade_half_life = true;
 		} else if (strcasecmp(key, "fps") == 0) {
 			long v = strtol(val, NULL, 10);
 			if (v > 0 && v <= 60)
@@ -768,11 +826,258 @@ static void load_watch_prefs(void)
 			if (v > 255)
 				v = 255;
 			ansi_fade_max_brightness = (int)v;
+		} else if (strcasecmp(key, "fade_in") == 0) {
+			double v = strtod(val, NULL);
+			if (v > 0.0 && v < 1000.0)
+				ansi_fade_in_seconds = v;
 		} else if (strcasecmp(key, "fade_bg") == 0) {
 			(void)parse_rgb_env(val, &ansi_fade_bg_r, &ansi_fade_bg_g, &ansi_fade_bg_b);
 		}
 	}
 	fclose(fp);
+}
+
+static void load_default_fg_from_env(void)
+{
+	const char *cfg = getenv("COLORFGBG");
+	if (!cfg || !*cfg)
+		return;
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%s", cfg);
+	char *sep = strpbrk(buf, ";:,");
+	if (!sep)
+		return;
+	*sep = '\0';
+	char *end = NULL;
+	long fg = strtol(buf, &end, 10);
+	if (end == buf || fg < 0 || fg > 255)
+		return;
+	xterm256_to_rgb((int)fg, &ansi_default_fg_r, &ansi_default_fg_g, &ansi_default_fg_b);
+	ansi_default_fg_valid = true;
+}
+
+static void query_default_fg(void)
+{
+	if (ansi_default_fg_valid)
+		return;
+	(void)!write(STDOUT_FILENO, "\x1b]10;?\x07", 8);
+
+	char buf[128];
+	size_t n = 0;
+	struct timeval tv;
+	fd_set rfds;
+	for (;;) {
+		FD_ZERO(&rfds);
+		FD_SET(STDIN_FILENO, &rfds);
+		tv.tv_sec = 0;
+		tv.tv_usec = 50000;
+		int r = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+		if (r <= 0)
+			break;
+		if (!FD_ISSET(STDIN_FILENO, &rfds))
+			break;
+		ssize_t got = read(STDIN_FILENO, buf + n, sizeof(buf) - 1 - n);
+		if (got <= 0)
+			break;
+		n += (size_t)got;
+		buf[n] = '\0';
+		if (strchr(buf, '\a') || strstr(buf, "\x1b\\"))
+			break;
+		if (n >= sizeof(buf) - 1)
+			break;
+	}
+
+	char *rgb = strstr(buf, "rgb:");
+	if (!rgb)
+		return;
+	int r = 0, g = 0, b = 0;
+	if (parse_rgb_response(rgb, &r, &g, &b)) {
+		ansi_default_fg_r = r;
+		ansi_default_fg_g = g;
+		ansi_default_fg_b = b;
+		ansi_default_fg_valid = true;
+	}
+}
+
+static void query_default_bg(void)
+{
+	(void)!write(STDOUT_FILENO, "\x1b]11;?\x07", 8);
+
+	char buf[128];
+	size_t n = 0;
+	struct timeval tv;
+	fd_set rfds;
+	for (;;) {
+		FD_ZERO(&rfds);
+		FD_SET(STDIN_FILENO, &rfds);
+		tv.tv_sec = 0;
+		tv.tv_usec = 50000;
+		int r = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+		if (r <= 0)
+			break;
+		if (!FD_ISSET(STDIN_FILENO, &rfds))
+			break;
+		ssize_t got = read(STDIN_FILENO, buf + n, sizeof(buf) - 1 - n);
+		if (got <= 0)
+			break;
+		n += (size_t)got;
+		buf[n] = '\0';
+		if (strchr(buf, '\a') || strstr(buf, "\x1b\\"))
+			break;
+		if (n >= sizeof(buf) - 1)
+			break;
+	}
+
+	char *rgb = strstr(buf, "rgb:");
+	if (!rgb) {
+		log_watch_debug("bg", 0, 0, 0, false);
+		return;
+	}
+	int r = 0, g = 0, b = 0;
+	if (parse_rgb_response(rgb, &r, &g, &b)) {
+		ansi_default_bg_r = r;
+		ansi_default_bg_g = g;
+		ansi_default_bg_b = b;
+		ansi_default_bg_valid = true;
+		log_watch_debug("bg", r, g, b, true);
+		return;
+	}
+	log_watch_debug("bg", 0, 0, 0, false);
+}
+
+static bool parse_rgb_response(const char *rgb, int *r, int *g, int *b)
+{
+	const char *p = strchr(rgb, ':');
+	if (!p)
+		return false;
+	p++;
+	int vals[3] = {0, 0, 0};
+	for (int i = 0; i < 3; i++) {
+		int v = 0;
+		int digits = 0;
+		while (*p && *p != '/' && digits < 4) {
+			char c = *p;
+			int d = -1;
+			if (c >= '0' && c <= '9')
+				d = c - '0';
+			else if (c >= 'a' && c <= 'f')
+				d = 10 + (c - 'a');
+			else if (c >= 'A' && c <= 'F')
+				d = 10 + (c - 'A');
+			else
+				break;
+			v = (v << 4) | d;
+			digits++;
+			p++;
+		}
+		if (digits == 0)
+			return false;
+		if (digits <= 2)
+			vals[i] = v;
+		else {
+			int maxv = (1 << (digits * 4)) - 1;
+			vals[i] = (v * 255 + maxv / 2) / maxv;
+		}
+		if (*p == '/')
+			p++;
+	}
+	*r = vals[0];
+	*g = vals[1];
+	*b = vals[2];
+	return true;
+}
+
+static void log_watch_debug(const char *label, int r, int g, int b, bool ok)
+{
+	FILE *fp = fopen("/tmp/watch-debug.log", "a");
+	if (!fp)
+		return;
+	fprintf(fp, "%s default_%s %s rgb=%d,%d,%d\n", program_invocation_short_name, label,
+		ok ? "ok" : "fail", r, g, b);
+	fclose(fp);
+}
+
+static void log_watch_settings(void)
+{
+	FILE *fp = fopen("/tmp/watch-debug.log", "a");
+	if (!fp)
+		return;
+	fprintf(fp,
+		"%s settings fade=%.3f half_life=%d fps=%d fade_in=%.3f fade_max=%d fade_bg=%d,%d,%d\n",
+		program_invocation_short_name,
+		ansi_fade_seconds,
+		ansi_fade_half_life ? 1 : 0,
+		ansi_fade_fps,
+		ansi_fade_in_seconds,
+		ansi_fade_max_brightness,
+		ansi_fade_bg_r,
+		ansi_fade_bg_g,
+		ansi_fade_bg_b);
+	fclose(fp);
+}
+
+static char *ansi_truncate_visible(const char *line, int cols)
+{
+	if (!line || !*line || cols <= 0)
+		return xstrdup("");
+	size_t len = strlen(line);
+	size_t cap = len + 16;
+	char *out = xmalloc(cap);
+	size_t o = 0;
+	int col = 0;
+	mbstate_t st;
+	memset(&st, 0, sizeof(st));
+
+	for (size_t i = 0; i < len && col < cols; ) {
+		if (line[i] == '\x1b' && i + 1 < len && line[i + 1] == '[') {
+			if (o + 2 >= cap) {
+				cap *= 2;
+				out = xrealloc(out, cap);
+			}
+			out[o++] = line[i++];
+			out[o++] = line[i++];
+			while (i < len) {
+				if (o + 1 >= cap) {
+					cap *= 2;
+					out = xrealloc(out, cap);
+				}
+				out[o++] = line[i];
+				if (line[i] == 'm') {
+					i++;
+					break;
+				}
+				i++;
+			}
+			continue;
+		}
+
+		size_t seq = utf8_seq_len((unsigned char)line[i]);
+		if (seq > 1 && i + seq > len)
+			seq = 1;
+		wchar_t wc;
+		size_t m = mbrtowc(&wc, line + i, seq, &st);
+		int w = 1;
+		if (m == (size_t)-1 || m == (size_t)-2) {
+			memset(&st, 0, sizeof(st));
+			seq = 1;
+			w = 1;
+		} else {
+			int wcw = wcwidth(wc);
+			w = wcw < 0 ? 1 : wcw;
+		}
+		if (col + w > cols)
+			break;
+		if (o + seq + 1 >= cap) {
+			cap *= 2;
+			out = xrealloc(out, cap);
+		}
+		memcpy(out + o, line + i, seq);
+		o += seq;
+		i += seq;
+		col += w;
+	}
+	out[o] = '\0';
+	return out;
 }
 
 static bool ansi_has_active_fade(void)
@@ -781,7 +1086,7 @@ static bool ansi_has_active_fade(void)
 		if (!ansi_char_age[row])
 			continue;
 		for (size_t i = 0; i < ansi_char_age_len[row]; i++) {
-			if (ansi_char_age[row][i] < (uint8_t)ansi_fade_cycles)
+			if (ansi_char_age[row][i] < ansi_fade_cycles)
 				return true;
 		}
 	}
@@ -1943,7 +2248,6 @@ int main(int argc, char *argv[])
 	struct timeval tosleep;
 	bool sleep_dontsleep, sleep_scrdumped, sleep_exit;
 	WINDOW *hdrwin = NULL;
-	bool ansi_exit_newline = false;
 	const struct option longopts[] = {
 		{"color", no_argument, 0, 'c'},
 		{"no-color", no_argument, 0, 'C'},
@@ -2067,18 +2371,18 @@ int main(int argc, char *argv[])
 	use_ansi = color_option_seen && color_explicit && (flags & WATCH_COLOR);
 	use_pty = (flags & WATCH_COLOR);
 	if (use_ansi) {
+		load_default_fg_from_env();
 		load_watch_prefs();
 		const char *fade_env = getenv("WATCH_FADE");
 		if (fade_env && *fade_env) {
-			long v = strtol(fade_env, NULL, 10);
-			if (v > 0 && v < 1000)
-				ansi_fade_seconds = (int)v;
+			double v = strtod(fade_env, NULL);
+			if (v > 0.0 && v < 1000.0)
+				ansi_fade_seconds = v;
 		}
 		const char *half_env = getenv("WATCH_HALF_LIFE");
 		if (half_env && *half_env) {
-			long v = strtol(half_env, NULL, 10);
-			if (v > 0 && v < 1000)
-				ansi_half_life_seconds = (int)v;
+			if (strcmp(half_env, "1") == 0 || strcasecmp(half_env, "true") == 0)
+				ansi_fade_half_life = true;
 		}
 		const char *fps_env = getenv("WATCH_FPS");
 		if (fps_env && *fps_env) {
@@ -2095,18 +2399,31 @@ int main(int argc, char *argv[])
 				v = 255;
 			ansi_fade_max_brightness = (int)v;
 		}
+		const char *fade_in_env = getenv("WATCH_FADE_IN");
+		if (fade_in_env && *fade_in_env) {
+			double v = strtod(fade_in_env, NULL);
+			if (v > 0.0 && v < 1000.0)
+				ansi_fade_in_seconds = v;
+		}
 		const char *bg_env = getenv("WATCH_FADE_BG");
 		if (bg_env && *bg_env) {
 			(void)parse_rgb_env(bg_env, &ansi_fade_bg_r, &ansi_fade_bg_g, &ansi_fade_bg_b);
 		}
-		if (ansi_half_life_seconds > 0) {
-			ansi_fade_half_life = true;
-			ansi_fade_half_life_frames = ansi_half_life_seconds * ansi_fade_fps;
-			if (ansi_fade_half_life_frames < 1)
-				ansi_fade_half_life_frames = 1;
-			ansi_fade_cycles = ansi_fade_half_life_frames * 6;
-		} else if (ansi_fade_seconds > 0) {
-			ansi_fade_cycles = ansi_fade_seconds * ansi_fade_fps;
+		log_watch_settings();
+		if (ansi_fade_in_seconds > 0.0) {
+			ansi_fade_in_frames = (int)(ansi_fade_in_seconds * ansi_fade_fps + 0.5);
+			if (ansi_fade_in_frames < 1)
+				ansi_fade_in_frames = 1;
+		}
+		if (ansi_fade_seconds > 0.0) {
+			if (ansi_fade_half_life) {
+				ansi_fade_half_life_frames = (int)(ansi_fade_seconds * ansi_fade_fps + 0.5);
+				if (ansi_fade_half_life_frames < 1)
+					ansi_fade_half_life_frames = 1;
+				ansi_fade_cycles = ansi_fade_half_life_frames * 6;
+			} else {
+				ansi_fade_cycles = (int)(ansi_fade_seconds * ansi_fade_fps + 0.5);
+			}
 		}
 	}
 	command_argv = argv + optind;  // for exec*()
@@ -2146,6 +2463,8 @@ int main(int argc, char *argv[])
 	if (use_ansi) {
 		setup_terminal_raw();
 		setvbuf(stdout, NULL, _IONBF, 0);
+		query_default_fg();
+		query_default_bg();
 		ansi_hide_cursor();
 		ansi_get_winsize();
 		ansi_reset_prev_buffers(MAIN_HEIGHT);
@@ -2221,11 +2540,11 @@ int main(int argc, char *argv[])
 						screen_changed = true;
 
 					size_t glyph_count = utf8_count_glyphs(plain);
-					uint8_t *new_ages = xcalloc(glyph_count, 1);
+					int16_t *new_ages = xcalloc(glyph_count, sizeof(*new_ages));
 					if (flags & WATCH_DIFF) {
 						if (!have_prev) {
 							for (size_t i = 0; i < glyph_count; i++)
-								new_ages[i] = (uint8_t)ansi_fade_cycles;
+								new_ages[i] = (int16_t)ansi_fade_cycles;
 						} else {
 							size_t i = 0;
 							size_t pi = 0;
@@ -2246,16 +2565,19 @@ int main(int argc, char *argv[])
 										ch = true;
 								}
 								if (ch) {
-									new_ages[g] = 0;
+									new_ages[g] = (ansi_fade_in_frames > 0) ? (int16_t)-ansi_fade_in_frames : 0;
 								} else if (ansi_char_age[row] && g < ansi_char_age_len[row]) {
-									uint8_t prev_age = ansi_char_age[row][g];
+									int16_t prev_age = ansi_char_age[row][g];
 									if (flags & WATCH_CUMUL) {
-										new_ages[g] = prev_age == 0 ? 0 : (uint8_t)ansi_fade_cycles;
+										new_ages[g] = prev_age <= 0 ? (int16_t)prev_age : (int16_t)ansi_fade_cycles;
 									} else {
-										new_ages[g] = prev_age < (uint8_t)ansi_fade_cycles ? (uint8_t)(prev_age + 1) : (uint8_t)ansi_fade_cycles;
+										if (prev_age < ansi_fade_cycles)
+											new_ages[g] = (int16_t)(prev_age + 1);
+										else
+											new_ages[g] = (int16_t)ansi_fade_cycles;
 									}
 								} else {
-									new_ages[g] = (uint8_t)ansi_fade_cycles;
+									new_ages[g] = (int16_t)ansi_fade_cycles;
 								}
 								i += seq;
 								if (!ch && pseq > 0)
@@ -2267,7 +2589,7 @@ int main(int argc, char *argv[])
 						}
 					} else {
 						for (size_t i = 0; i < glyph_count; i++)
-							new_ages[i] = (uint8_t)ansi_fade_cycles;
+							new_ages[i] = (int16_t)ansi_fade_cycles;
 					}
 
 					char *out_line = NULL;
@@ -2412,7 +2734,7 @@ int main(int argc, char *argv[])
 				case 'q':
 					sleep_dontsleep = sleep_exit = true;
 					if (use_ansi)
-						ansi_exit_newline = true;
+						ansi_exit_newline = 1;
 					break;
 				case ' ':
 					sleep_dontsleep = true;
@@ -2437,7 +2759,7 @@ int main(int argc, char *argv[])
 								if (!ansi_char_age[row])
 									continue;
 								for (size_t i2 = 0; i2 < ansi_char_age_len[row]; i2++) {
-									if (ansi_char_age[row][i2] < (uint8_t)ansi_fade_cycles)
+									if (ansi_char_age[row][i2] < ansi_fade_cycles)
 										ansi_char_age[row][i2]++;
 								}
 							}
