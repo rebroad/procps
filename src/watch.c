@@ -121,6 +121,9 @@ static char **ansi_prev_plain;
 static int *ansi_line_age;
 static bool *ansi_line_seen;
 static int ansi_prev_count;
+static uint8_t **ansi_char_age;
+static size_t *ansi_char_age_len;
+static int ansi_fade_cycles = 8;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
@@ -407,20 +410,90 @@ static char *ansi_apply_background(const char *line, const char *bg)
 	return out;
 }
 
+static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t age_len, int fade_cycles)
+{
+	if (!line || !*line)
+		return xstrdup("");
+	size_t len = strlen(line);
+	size_t cap = len * 6 + 64;
+	char *out = xmalloc(cap);
+	size_t o = 0;
+	size_t vis = 0;
+
+	for (size_t i = 0; i < len; i++) {
+		if (line[i] == '\x1b' && i + 1 < len && line[i + 1] == '[') {
+			out[o++] = line[i];
+			i++;
+			out[o++] = line[i];
+			while (i + 1 < len && line[i + 1] != 'm') {
+				i++;
+				out[o++] = line[i];
+			}
+			if (i + 1 < len && line[i + 1] == 'm') {
+				i++;
+				out[o++] = 'm';
+			}
+			continue;
+		}
+
+		bool highlight = false;
+		int intensity = 0;
+		if (vis < age_len && ages) {
+			if (ages[vis] < (uint8_t)fade_cycles) {
+				highlight = true;
+				intensity = (fade_cycles - ages[vis]) * 255 / fade_cycles;
+			}
+		}
+		if (highlight) {
+			char bg[64];
+			int r = 255 * intensity / 255;
+			int g = 200 * intensity / 255;
+			int b = 0;
+			int blen = snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", r, g, b);
+			if (o + (size_t)blen + 8 >= cap) {
+				cap *= 2;
+				out = xrealloc(out, cap);
+			}
+			memcpy(out + o, bg, (size_t)blen);
+			o += (size_t)blen;
+			out[o++] = line[i];
+			out[o++] = '\x1b';
+			out[o++] = '[';
+			out[o++] = '4';
+			out[o++] = '9';
+			out[o++] = 'm';
+		} else {
+			out[o++] = line[i];
+		}
+		vis++;
+		if (o + 32 >= cap) {
+			cap *= 2;
+			out = xrealloc(out, cap);
+		}
+	}
+	out[o] = '\0';
+	return out;
+}
+
 static void ansi_reset_prev_buffers(int count)
 {
 	for (int i = 0; i < ansi_prev_count; i++) {
 		free(ansi_prev_lines ? ansi_prev_lines[i] : NULL);
 		free(ansi_prev_plain ? ansi_prev_plain[i] : NULL);
+		free(ansi_char_age ? ansi_char_age[i] : NULL);
 	}
 	free(ansi_prev_lines);
 	free(ansi_prev_plain);
 	free(ansi_line_age);
 	free(ansi_line_seen);
+	free(ansi_char_age);
+	free(ansi_char_age_len);
 	ansi_prev_lines = xcalloc((size_t)count, sizeof(*ansi_prev_lines));
 	ansi_prev_plain = xcalloc((size_t)count, sizeof(*ansi_prev_plain));
 	ansi_line_age = xcalloc((size_t)count, sizeof(*ansi_line_age));
 	ansi_line_seen = xcalloc((size_t)count, sizeof(*ansi_line_seen));
+	ansi_char_age = xcalloc((size_t)count, sizeof(*ansi_char_age));
+	ansi_char_age_len = xcalloc((size_t)count, sizeof(*ansi_char_age_len));
 	ansi_prev_count = count;
 }
 
@@ -1474,13 +1547,13 @@ static uint8_t run_command_ansi(char ***out_lines, int max_lines, int *out_count
 		ws.ws_col = width;
 		child = forkpty(&outfd, NULL, NULL, &ws);
 		if (child < 0)
-			endwin_xerr(2, _("unable to fork process"));
+			err(2, _("unable to fork process"));
 	} else {
 		if (pipe(pipefd) < 0)
-			endwin_xerr(2, _("unable to create IPC pipes"));
+			err(2, _("unable to create IPC pipes"));
 		child = fork();
 		if (child < 0)
-			endwin_xerr(2, _("unable to fork process"));
+			err(2, _("unable to fork process"));
 		outfd = pipefd[0];
 	}
 
@@ -1665,6 +1738,14 @@ int main(int argc, char *argv[])
         }
 	use_ansi = color_option_seen && color_explicit && (flags & WATCH_COLOR);
 	use_pty = (flags & WATCH_COLOR);
+	if (use_ansi) {
+		const char *fade_env = getenv("WATCH_DIFF_FADE");
+		if (fade_env && *fade_env) {
+			long v = strtol(fade_env, NULL, 10);
+			if (v > 0 && v < 1000)
+				ansi_fade_cycles = (int)v;
+		}
+	}
 	command_argv = argv + optind;  // for exec*()
 	command_len = strlen(argv[optind]);
 	command = xmalloc(command_len+1);  // never freed
@@ -1704,11 +1785,7 @@ int main(int argc, char *argv[])
 		setvbuf(stdout, NULL, _IONBF, 0);
 		ansi_hide_cursor();
 		ansi_get_winsize();
-		{
-			int header_pad = (flags & WATCH_NOTITLE) ? 0 : 1;
-			int ansi_main_height = MAIN_HEIGHT - header_pad;
-			ansi_reset_prev_buffers(ansi_main_height);
-		}
+		ansi_reset_prev_buffers(MAIN_HEIGHT);
 	} else {
 		/* Set up tty for curses use.  */
 		initscr();  // succeeds or exit()s, may install sig handlers
@@ -1739,23 +1816,18 @@ int main(int argc, char *argv[])
 		if (use_ansi) {
 			char **lines = NULL;
 			int line_count = 0;
-			const int fade_cycles = 8;
-			int header_pad = (flags & WATCH_NOTITLE) ? 0 : 1;
-			int ansi_main_height = MAIN_HEIGHT - header_pad;
 			screen_changed = false;
 			if (screen_size_changed) {
 				screen_size_changed = false;
 				ansi_get_winsize();
-				header_pad = (flags & WATCH_NOTITLE) ? 0 : 1;
-				ansi_main_height = MAIN_HEIGHT - header_pad;
-				ansi_reset_prev_buffers(ansi_main_height);
+				ansi_reset_prev_buffers(MAIN_HEIGHT);
 				first_screen = true;
 			}
-			ansi_clear_screen();
+			ansi_move(0, 0);
 			t = get_time_usec();
 			if (flags & WATCH_PRECISE)
 				last_tick = t;
-			cmdexit = run_command_ansi(&lines, ansi_main_height, &line_count);
+			cmdexit = run_command_ansi(&lines, MAIN_HEIGHT, &line_count);
 			if (flags & WATCH_PRECISE)
 				ansi_output_headers(get_time_usec() - t, cmdexit);
 			else {
@@ -1763,54 +1835,50 @@ int main(int argc, char *argv[])
 				ansi_output_headers(last_tick - t, cmdexit);
 			}
 
-			int start_row = (flags & WATCH_NOTITLE) ? 0 : (HEADER_HEIGHT + 1);
-			for (int row = 0; row < ansi_main_height; row++) {
+			int start_row = (flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT;
+			for (int row = 0; row < MAIN_HEIGHT; row++) {
 				const char *line = (row < line_count && lines[row]) ? lines[row] : "";
 				char *plain = strip_ansi_sgr(line);
 				bool changed = true;
-				if (!first_screen && ansi_prev_plain[row]) {
+				size_t plen = strlen(plain);
+				size_t prev_len = ansi_prev_plain[row] ? strlen(ansi_prev_plain[row]) : 0;
+				bool have_prev = (!first_screen && ansi_prev_plain[row]);
+				if (have_prev) {
 					changed = strcmp(plain, ansi_prev_plain[row]) != 0;
 				}
-				if (flags & WATCH_ALL_DIFF) {
-					if (changed)
-						screen_changed = true;
-				}
+				if ((flags & WATCH_ALL_DIFF) && have_prev && changed)
+					screen_changed = true;
+
+				uint8_t *new_ages = xcalloc(plen, 1);
 				if (flags & WATCH_DIFF) {
-					if (first_screen) {
-						ansi_line_age[row] = fade_cycles;
-						ansi_line_seen[row] = false;
-					} else if (changed) {
-						ansi_line_age[row] = 0;
-						ansi_line_seen[row] = true;
-					} else if (! (flags & WATCH_CUMUL)) {
-						if (ansi_line_age[row] < fade_cycles)
-							ansi_line_age[row] += 1;
+					if (!have_prev) {
+						for (size_t i = 0; i < plen; i++)
+							new_ages[i] = (uint8_t)ansi_fade_cycles;
+					} else
+					for (size_t i = 0; i < plen; i++) {
+						bool ch = (i >= prev_len) || (ansi_prev_plain[row] && plain[i] != ansi_prev_plain[row][i]);
+						if (ch) {
+							new_ages[i] = 0;
+						} else if (ansi_char_age[row] && i < ansi_char_age_len[row]) {
+							uint8_t prev_age = ansi_char_age[row][i];
+							if (flags & WATCH_CUMUL) {
+								new_ages[i] = prev_age == 0 ? 0 : (uint8_t)ansi_fade_cycles;
+							} else {
+								new_ages[i] = prev_age < (uint8_t)ansi_fade_cycles ? (uint8_t)(prev_age + 1) : (uint8_t)ansi_fade_cycles;
+							}
+						} else {
+							new_ages[i] = (uint8_t)ansi_fade_cycles;
+						}
 					}
 				} else {
-					ansi_line_age[row] = fade_cycles;
-					ansi_line_seen[row] = false;
+					for (size_t i = 0; i < plen; i++)
+						new_ages[i] = (uint8_t)ansi_fade_cycles;
 				}
 
 				char *out_line = NULL;
-				if (flags & WATCH_DIFF) {
-					bool highlight = (flags & WATCH_CUMUL) ? ansi_line_seen[row] : (ansi_line_age[row] < fade_cycles);
-					if (highlight) {
-						int age = ansi_line_age[row];
-						if (age < 0) age = 0;
-						if (age > fade_cycles) age = fade_cycles;
-						int intensity = (fade_cycles - age) * 255 / fade_cycles;
-						int r = 255;
-						int g = 200;
-						int b = 0;
-						r = r * intensity / 255;
-						g = g * intensity / 255;
-						b = b * intensity / 255;
-						char bg[64];
-						snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", r, g, b);
-						out_line = ansi_apply_background(line, bg);
-					}
-				}
-				if (!out_line)
+				if (flags & WATCH_DIFF)
+					out_line = ansi_apply_char_diff(line, new_ages, plen, ansi_fade_cycles);
+				else
 					out_line = xstrdup(line);
 
 				ansi_write_line(start_row + row, out_line);
@@ -1818,8 +1886,11 @@ int main(int argc, char *argv[])
 
 				free(ansi_prev_lines[row]);
 				free(ansi_prev_plain[row]);
+				free(ansi_char_age[row]);
 				ansi_prev_lines[row] = xstrdup(line);
 				ansi_prev_plain[row] = plain;
+				ansi_char_age[row] = new_ages;
+				ansi_char_age_len[row] = plen;
 			}
 			for (int i2 = 0; i2 < line_count; i2++)
 				free(lines[i2]);
