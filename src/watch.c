@@ -127,8 +127,10 @@ static size_t *ansi_char_age_len;
 static int ansi_fade_cycles = 8;
 static int ansi_fade_fps = 12;
 static int ansi_fade_seconds = 0;
+static int ansi_half_life_seconds = 0;
 static bool ansi_fade_half_life = false;
 static int ansi_fade_half_life_frames = 0;
+static int ansi_fade_max_brightness = 255;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
@@ -448,9 +450,9 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 				highlight = true;
 				if (ansi_fade_half_life && ansi_fade_half_life_frames > 0) {
 					double ratio = pow(0.5, (double)ages[vis] / (double)ansi_fade_half_life_frames);
-					intensity = (int)(ratio * 255.0);
+					intensity = (int)(ratio * (double)ansi_fade_max_brightness);
 				} else {
-					intensity = (fade_cycles - ages[vis]) * 255 / fade_cycles;
+					intensity = (fade_cycles - ages[vis]) * ansi_fade_max_brightness / fade_cycles;
 				}
 			}
 		}
@@ -1652,7 +1654,7 @@ int main(int argc, char *argv[])
 	uint8_t cmdexit;
 	struct timeval tosleep;
 	bool sleep_dontsleep, sleep_scrdumped, sleep_exit;
-        WINDOW *hdrwin = NULL;
+	WINDOW *hdrwin = NULL;
 	const struct option longopts[] = {
 		{"color", no_argument, 0, 'c'},
 		{"no-color", no_argument, 0, 'C'},
@@ -1776,16 +1778,17 @@ int main(int argc, char *argv[])
 	use_ansi = color_option_seen && color_explicit && (flags & WATCH_COLOR);
 	use_pty = (flags & WATCH_COLOR);
 	if (use_ansi) {
-		const char *fade_env = getenv("WATCH_DIFF_FADE");
+		const char *fade_env = getenv("WATCH_FADE");
 		if (fade_env && *fade_env) {
 			long v = strtol(fade_env, NULL, 10);
 			if (v > 0 && v < 1000)
 				ansi_fade_seconds = (int)v;
 		}
-		const char *half_env = getenv("WATCH_DIFF_HALF_LIFE");
+		const char *half_env = getenv("WATCH_HALF_LIFE");
 		if (half_env && *half_env) {
-			if (strcmp(half_env, "1") == 0 || strcasecmp(half_env, "true") == 0)
-				ansi_fade_half_life = true;
+			long v = strtol(half_env, NULL, 10);
+			if (v > 0 && v < 1000)
+				ansi_half_life_seconds = (int)v;
 		}
 		const char *fps_env = getenv("WATCH_DIFF_FPS");
 		if (fps_env && *fps_env) {
@@ -1793,15 +1796,23 @@ int main(int argc, char *argv[])
 			if (v > 0 && v <= 60)
 				ansi_fade_fps = (int)v;
 		}
-		if (ansi_fade_seconds > 0) {
-			if (ansi_fade_half_life) {
-				ansi_fade_half_life_frames = ansi_fade_seconds * ansi_fade_fps;
-				if (ansi_fade_half_life_frames < 1)
-					ansi_fade_half_life_frames = 1;
-				ansi_fade_cycles = ansi_fade_half_life_frames * 6;
-			} else {
-				ansi_fade_cycles = ansi_fade_seconds * ansi_fade_fps;
-			}
+		const char *max_env = getenv("WATCH_FADE_MAX");
+		if (max_env && *max_env) {
+			long v = strtol(max_env, NULL, 10);
+			if (v < 0)
+				v = 0;
+			if (v > 255)
+				v = 255;
+			ansi_fade_max_brightness = (int)v;
+		}
+		if (ansi_half_life_seconds > 0) {
+			ansi_fade_half_life = true;
+			ansi_fade_half_life_frames = ansi_half_life_seconds * ansi_fade_fps;
+			if (ansi_fade_half_life_frames < 1)
+				ansi_fade_half_life_frames = 1;
+			ansi_fade_cycles = ansi_fade_half_life_frames * 6;
+		} else if (ansi_fade_seconds > 0) {
+			ansi_fade_cycles = ansi_fade_seconds * ansi_fade_fps;
 		}
 	}
 	command_argv = argv + optind;  // for exec*()
