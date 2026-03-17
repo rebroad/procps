@@ -46,6 +46,7 @@
 #include <inttypes.h>
 #include <locale.h>
 #include <signal.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -110,6 +111,20 @@ static size_t command_len;
 static char *const *command_argv;
 static const char *shotsdir = "";
 static bool use_pty;
+static bool use_ansi;
+static bool termios_active;
+static struct termios termios_orig;
+static char **ansi_prev_lines;
+static char **ansi_prev_plain;
+static int *ansi_line_age;
+static bool *ansi_line_seen;
+static int ansi_prev_count;
+
+static void restore_terminal(void);
+static void ansi_show_cursor(void);
+
+typedef uf64 watch_usec_t;
+#define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
 
 #define MAIN_HEIGHT (height - (flags & WATCH_NOTITLE?0:HEADER_HEIGHT))
 
@@ -154,6 +169,11 @@ static void __attribute__ ((__noreturn__)) usage(FILE * out)
 
 static void die(int notused __attribute__ ((__unused__)))
 {
+	if (use_ansi) {
+		ansi_show_cursor();
+		restore_terminal();
+		exit(EXIT_SUCCESS);
+	}
 	endwin_exit(EXIT_SUCCESS);
 }
 
@@ -174,6 +194,274 @@ static void reset_ansi(void)
 	fg_col = 0;
 	bg_col = 0;
 }
+
+static bool term_supports_truecolor(void)
+{
+	const char *colorterm = getenv("COLORTERM");
+	if (colorterm && (!strcasecmp(colorterm, "truecolor") || !strcasecmp(colorterm, "24bit")))
+		return true;
+	const char *term = getenv("TERM");
+	if (!term)
+		return false;
+	if (strstr(term, "direct"))
+		return true;
+	if (strstr(term, "truecolor"))
+		return true;
+	return false;
+}
+
+static void restore_terminal(void)
+{
+	if (termios_active) {
+		tcsetattr(STDIN_FILENO, TCSANOW, &termios_orig);
+		termios_active = false;
+	}
+}
+
+static void setup_terminal_raw(void)
+{
+	struct termios t;
+	if (tcgetattr(STDIN_FILENO, &termios_orig) == 0) {
+		termios_active = true;
+		t = termios_orig;
+		cfmakeraw(&t);
+		tcsetattr(STDIN_FILENO, TCSANOW, &t);
+		atexit(restore_terminal);
+	}
+}
+
+static void ansi_hide_cursor(void)
+{
+	const char *s = "\x1b[?25l";
+	(void)!write(STDOUT_FILENO, s, strlen(s));
+}
+
+static void ansi_show_cursor(void)
+{
+	const char *s = "\x1b[?25h";
+	(void)!write(STDOUT_FILENO, s, strlen(s));
+}
+
+static void ansi_clear_screen(void)
+{
+	const char *s = "\x1b[H\x1b[2J";
+	(void)!write(STDOUT_FILENO, s, strlen(s));
+}
+
+static void ansi_move(int row, int col)
+{
+	char buf[32];
+	int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", row + 1, col + 1);
+	if (len > 0)
+		(void)!write(STDOUT_FILENO, buf, (size_t)len);
+}
+
+static char *strip_ansi_sgr(const char *line)
+{
+	size_t len = strlen(line);
+	char *out = xmalloc(len + 1);
+	size_t j = 0;
+	for (size_t i = 0; i < len; i++) {
+		if (line[i] == '\x1b' && line[i + 1] == '[') {
+			i += 2;
+			while (i < len && line[i] != 'm')
+				i++;
+			continue;
+		}
+		out[j++] = line[i];
+	}
+	out[j] = '\0';
+	return out;
+}
+
+static void ansi_get_winsize(void)
+{
+	struct winsize ws;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+		height = ws.ws_row;
+		width = ws.ws_col;
+	} else {
+		height = HEIGHT_FALLBACK;
+		width = WIDTH_FALLBACK;
+	}
+}
+
+static void ansi_write_line(int row, const char *line)
+{
+	ansi_move(row, 0);
+	if (line && *line)
+		(void)!write(STDOUT_FILENO, line, strlen(line));
+	(void)!write(STDOUT_FILENO, "\x1b[K", 3); // clear to end of line
+}
+
+static char *ansi_compose_line(const char *left, const char *right)
+{
+	if (width <= 0) {
+		return xstrdup("");
+	}
+	size_t w = (size_t)width;
+	char *buf = xmalloc(w + 1);
+	memset(buf, ' ', w);
+	buf[w] = '\0';
+	if (left && *left) {
+		size_t l = strlen(left);
+		if (l > w)
+			l = w;
+		memcpy(buf, left, l);
+	}
+	if (right && *right) {
+		size_t r = strlen(right);
+		if (r <= w) {
+			size_t start = w - r;
+			memcpy(buf + start, right, r);
+		}
+	}
+	return buf;
+}
+
+static void ansi_output_headers(watch_usec_t span, uint8_t exitcode)
+{
+	if (flags & WATCH_NOTITLE)
+		return;
+
+	char left[256];
+	char right[256];
+	char low[128];
+
+	snprintf(left, sizeof(left), "Every %.1fs: %s", interval_real, command);
+	{
+		char hostbuf[256];
+		if (gethostname(hostbuf, sizeof(hostbuf)) != 0)
+			hostbuf[0] = '\0';
+		hostbuf[sizeof(hostbuf) - 1] = '\0';
+		time_t t = time(NULL);
+		char ts[128];
+		size_t n = strftime(ts, sizeof(ts), "%c", localtime(&t));
+		if (n == 0)
+			ts[0] = '\0';
+		snprintf(right, sizeof(right), "%s%s%s", hostbuf, hostbuf[0] ? ": " : "", ts);
+	}
+
+	if (span > USECS_PER_SEC * 24 * 60 * 60)
+		snprintf(low, sizeof(low), "in >1 day (%" PRIu8 ")", exitcode);
+	else if (span < 1000)
+		snprintf(low, sizeof(low), "in <%.3fs (%" PRIu8 ")", 0.001, exitcode);
+	else
+		snprintf(low, sizeof(low), "in %.3Lfs (%" PRIu8 ")", (long double)span / USECS_PER_SEC, exitcode);
+
+	char *line0 = ansi_compose_line(left, right);
+	char *line1 = ansi_compose_line(low, "");
+	ansi_write_line(0, line0);
+	ansi_write_line(1, line1);
+	free(line0);
+	free(line1);
+}
+
+static char *ansi_apply_background(const char *line, const char *bg)
+{
+	if (!bg || !*bg)
+		return xstrdup(line ? line : "");
+	size_t len = line ? strlen(line) : 0;
+	size_t bglen = strlen(bg);
+	size_t cap = len * 4 + bglen * 8 + 32;
+	char *out = xmalloc(cap);
+	size_t o = 0;
+	if (bglen) {
+		memcpy(out + o, bg, bglen);
+		o += bglen;
+	}
+	for (size_t i = 0; i < len; i++) {
+		out[o++] = line[i];
+		if (line[i] == '\x1b' && i + 1 < len && line[i + 1] == '[') {
+			i += 1;
+			out[o++] = line[i];
+			while (i + 1 < len && line[i + 1] != 'm') {
+				i++;
+				out[o++] = line[i];
+			}
+			if (i + 1 < len && line[i + 1] == 'm') {
+				i++;
+				out[o++] = 'm';
+				if (bglen) {
+					memcpy(out + o, bg, bglen);
+					o += bglen;
+				}
+			}
+		}
+		if (o + bglen + 8 >= cap) {
+			cap *= 2;
+			out = xrealloc(out, cap);
+		}
+	}
+	if (o + 4 < cap) {
+		out[o++] = '\x1b';
+		out[o++] = '[';
+		out[o++] = '0';
+		out[o++] = 'm';
+	}
+	out[o] = '\0';
+	return out;
+}
+
+static void ansi_reset_prev_buffers(int count)
+{
+	for (int i = 0; i < ansi_prev_count; i++) {
+		free(ansi_prev_lines ? ansi_prev_lines[i] : NULL);
+		free(ansi_prev_plain ? ansi_prev_plain[i] : NULL);
+	}
+	free(ansi_prev_lines);
+	free(ansi_prev_plain);
+	free(ansi_line_age);
+	free(ansi_line_seen);
+	ansi_prev_lines = xcalloc((size_t)count, sizeof(*ansi_prev_lines));
+	ansi_prev_plain = xcalloc((size_t)count, sizeof(*ansi_prev_plain));
+	ansi_line_age = xcalloc((size_t)count, sizeof(*ansi_line_age));
+	ansi_line_seen = xcalloc((size_t)count, sizeof(*ansi_line_seen));
+	ansi_prev_count = count;
+}
+
+static char **ansi_read_lines(FILE *p, int *out_count)
+{
+	size_t cap = 8192;
+	size_t len = 0;
+	char *buf = xmalloc(cap);
+	size_t n;
+	char chunk[4096];
+	while ((n = fread(chunk, 1, sizeof(chunk), p)) > 0) {
+		if (len + n + 1 > cap) {
+			while (len + n + 1 > cap)
+				cap *= 2;
+			buf = xrealloc(buf, cap);
+		}
+		memcpy(buf + len, chunk, n);
+		len += n;
+	}
+	buf[len] = '\0';
+
+	for (size_t i = 0; i < len; i++) {
+		if (buf[i] == '\r')
+			buf[i] = '\n';
+	}
+
+	int max_lines = MAIN_HEIGHT;
+	char **lines = xcalloc((size_t)max_lines, sizeof(*lines));
+	int count = 0;
+	size_t start = 0;
+	for (size_t i = 0; i <= len && count < max_lines; i++) {
+		if (buf[i] == '\n' || buf[i] == '\0') {
+			size_t l = i - start;
+			char *line = xmalloc(l + 1);
+			memcpy(line, buf + start, l);
+			line[l] = '\0';
+			lines[count++] = line;
+			start = i + 1;
+		}
+	}
+	free(buf);
+	*out_count = count;
+	return lines;
+}
+
 
 static uf8 rgb_to_ansi256(int r, int g, int b)
 {
@@ -472,9 +760,6 @@ static void process_ansi(FILE * fp)
 }
 
 
-
-typedef uf64 watch_usec_t;
-#define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
 
 static inline watch_usec_t get_time_usec(void)
 {
@@ -985,13 +1270,13 @@ static uint8_t run_command(void)
 		ws.ws_col = width;
 		child = forkpty(&outfd, NULL, NULL, &ws);
 		if (child < 0)
-			endwin_xerr(2, _("unable to fork process"));
+			err(2, _("unable to fork process"));
 	} else {
 		if (pipe(pipefd) < 0)
-			endwin_xerr(2, _("unable to create IPC pipes"));
+			err(2, _("unable to create IPC pipes"));
 		child = fork();
 		if (child < 0)
-			endwin_xerr(2, _("unable to fork process"));
+			err(2, _("unable to fork process"));
 		outfd = pipefd[0];
 	}
 
@@ -1160,6 +1445,80 @@ static uint8_t run_command(void)
 	return 0x80 + (WTERMSIG(status) & 0x7f);
 }
 
+static uint8_t run_command_ansi(char ***out_lines, int *out_count)
+{
+	int pipefd[2], status;
+	int outfd;
+	pid_t child;
+	fflush(stdout);
+	fflush(stderr);
+
+	if (use_pty) {
+		struct winsize ws;
+		memset(&ws, 0, sizeof(ws));
+		ws.ws_row = MAIN_HEIGHT;
+		ws.ws_col = width;
+		child = forkpty(&outfd, NULL, NULL, &ws);
+		if (child < 0)
+			endwin_xerr(2, _("unable to fork process"));
+	} else {
+		if (pipe(pipefd) < 0)
+			endwin_xerr(2, _("unable to create IPC pipes"));
+		child = fork();
+		if (child < 0)
+			endwin_xerr(2, _("unable to fork process"));
+		outfd = pipefd[0];
+	}
+
+	if (child == 0) {
+		fclose(stdout);
+		fclose(stderr);
+		if (!use_pty) {
+			while (close(pipefd[0]) == -1 && errno == EINTR) ;
+			while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
+			while (close(pipefd[1]) == -1 && errno == EINTR) ;
+			while (dup2(STDOUT_FILENO, STDERR_FILENO) == -1 && errno == EINTR) ;
+		}
+
+		if (flags & WATCH_EXEC) {
+			execvp(command_argv[0], command_argv);
+			const char *const errmsg = strerror(errno);
+			(void)!write(STDERR_FILENO, command_argv[0], strlen(command_argv[0]));
+			(void)!write(STDERR_FILENO, ": ", 2);
+			(void)!write(STDERR_FILENO, errmsg, strlen(errmsg));
+			_Exit(0x7f);
+		}
+		status = system(command);
+		if (status == -1) {
+			(void)!write(STDERR_FILENO, command, command_len);
+			(void)!write(STDERR_FILENO, ": unable to run", 15);
+			_Exit(0x7f);
+		}
+		if (WIFEXITED(status))
+			_Exit(WEXITSTATUS(status));
+		assert(WIFSIGNALED(status));
+		_Exit(0x80 + (WTERMSIG(status) & 0x7f));
+	}
+
+	if (!use_pty)
+		while (close(pipefd[1]) == -1 && errno == EINTR) ;
+	FILE *p = fdopen(outfd, "r");
+	if (!p)
+		err(2, _("fdopen"));
+	setvbuf(p, NULL, _IOFBF, BUFSIZ);
+	*out_lines = ansi_read_lines(p, out_count);
+	fclose(p);
+
+	while (waitpid(child, &status, 0) == -1) {
+		if (errno != EINTR)
+			return 0x7f;
+	}
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	assert(WIFSIGNALED(status));
+	return 0x80 + (WTERMSIG(status) & 0x7f);
+}
+
 int main(int argc, char *argv[])
 {
 	int i;
@@ -1286,6 +1645,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, _("Follow -f option conflicts with change options -d,-e or -q"));
             usage(stderr);
         }
+	use_ansi = (flags & WATCH_COLOR);
 	use_pty = (flags & WATCH_COLOR);
 	command_argv = argv + optind;  // for exec*()
 	command_len = strlen(argv[optind]);
@@ -1321,72 +1681,173 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, die);
 	signal(SIGHUP, die);
 	signal(SIGWINCH, winch_handler);
-	/* Set up tty for curses use.  */
-	initscr();  // succeeds or exit()s, may install sig handlers
-        getmaxyx(stdscr, height, width);
-        if (flags & WATCH_NOTITLE) {
-            mainwin = newwin(height, width, 0,0);
-        } else {
-            mainwin = newwin(height-HEADER_HEIGHT, width, HEADER_HEIGHT,0);
-            hdrwin = newwin(HEADER_HEIGHT, width, 0, 0);
-        }
-        if (flags & WATCH_FOLLOW)
-            scrollok(mainwin, TRUE);
-	if (flags & WATCH_COLOR) {
-		if (has_colors()) {
-			start_color();
-			use_default_colors();
-			init_ansi_colors();
+	if (use_ansi) {
+		setup_terminal_raw();
+		setvbuf(stdout, NULL, _IONBF, 0);
+		ansi_hide_cursor();
+		ansi_get_winsize();
+		ansi_reset_prev_buffers(MAIN_HEIGHT);
+	} else {
+		/* Set up tty for curses use.  */
+		initscr();  // succeeds or exit()s, may install sig handlers
+		getmaxyx(stdscr, height, width);
+		if (flags & WATCH_NOTITLE) {
+			mainwin = newwin(height, width, 0,0);
+		} else {
+			mainwin = newwin(height-HEADER_HEIGHT, width, HEADER_HEIGHT,0);
+			hdrwin = newwin(HEADER_HEIGHT, width, 0, 0);
 		}
-		else flags &= ~WATCH_COLOR;
+		if (flags & WATCH_FOLLOW)
+			scrollok(mainwin, TRUE);
+		if (flags & WATCH_COLOR) {
+			if (has_colors()) {
+				start_color();
+				use_default_colors();
+				init_ansi_colors();
+			}
+			else flags &= ~WATCH_COLOR;
+		}
+		nonl();
+		noecho();
+		cbreak();
+		curs_set(0);
 	}
-	nonl();
-	noecho();
-	cbreak();
-	curs_set(0);
 
 	while (1) {
-		reset_ansi();
-		set_ansi_attribute(-1, NULL);
-		if (screen_size_changed) {
-			screen_size_changed = false;  // "atomic" test-and-set
-                        endwin();
-                        refresh();
-                        getmaxyx(stdscr, height, width);
-                        resizeterm(height, width);
-                        wresize(mainwin, MAIN_HEIGHT, width);
-			first_screen = true;
-		}
+		if (use_ansi) {
+			char **lines = NULL;
+			int line_count = 0;
+			const int fade_cycles = 8;
+			screen_changed = false;
+			if (screen_size_changed) {
+				screen_size_changed = false;
+				ansi_get_winsize();
+				ansi_reset_prev_buffers(MAIN_HEIGHT);
+				first_screen = true;
+			}
+			ansi_clear_screen();
+			t = get_time_usec();
+			if (flags & WATCH_PRECISE)
+				last_tick = t;
+			cmdexit = run_command_ansi(&lines, &line_count);
+			if (flags & WATCH_PRECISE)
+				ansi_output_headers(get_time_usec() - t, cmdexit);
+			else {
+				last_tick = get_time_usec();
+				ansi_output_headers(last_tick - t, cmdexit);
+			}
 
-		output_lowheader_pre(hdrwin);
-		output_header(hdrwin);
-		t = get_time_usec();
-		if (flags & WATCH_PRECISE)
-			last_tick = t;
-		cmdexit = run_command();
-		if (flags & WATCH_PRECISE)
-			output_lowheader(hdrwin, get_time_usec() - t, cmdexit);
-		else {
-			last_tick = get_time_usec();
-			output_lowheader(hdrwin, last_tick - t, cmdexit);
-		}
-		wrefresh(hdrwin);
-
-		if (cmdexit) {
-			if (flags & WATCH_BEEP)
-				beep();  // doesn't require refresh()
-			if (flags & WATCH_ERREXIT) {
-				// TODO: Hard to see when there's cmd output around it. Add
-				// spaces or move to lowheader.
-				mvwaddstr(mainwin, MAIN_HEIGHT-1, 0, _("command exit with a non-zero status, press a key to exit"));
-				i = fcntl(STDIN_FILENO, F_GETFL);
-				if (i >= 0 && fcntl(STDIN_FILENO, F_SETFL, i|O_NONBLOCK) >= 0) {
-					while (getchar() != EOF) ;
-					fcntl(STDIN_FILENO, F_SETFL, i);
+			int start_row = (flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT;
+			for (int row = 0; row < MAIN_HEIGHT; row++) {
+				const char *line = (row < line_count && lines[row]) ? lines[row] : "";
+				char *plain = strip_ansi_sgr(line);
+				bool changed = true;
+				if (!first_screen && ansi_prev_plain[row]) {
+					changed = strcmp(plain, ansi_prev_plain[row]) != 0;
 				}
-				refresh();
+				if (flags & WATCH_ALL_DIFF) {
+					if (changed)
+						screen_changed = true;
+				}
+				if (flags & WATCH_DIFF) {
+					if (changed) {
+						ansi_line_age[row] = 0;
+						ansi_line_seen[row] = true;
+					} else if (! (flags & WATCH_CUMUL)) {
+						if (ansi_line_age[row] < fade_cycles)
+							ansi_line_age[row] += 1;
+					}
+				} else {
+					ansi_line_age[row] = fade_cycles;
+					ansi_line_seen[row] = false;
+				}
+
+				char *out_line = NULL;
+				if (flags & WATCH_DIFF) {
+					bool highlight = (flags & WATCH_CUMUL) ? ansi_line_seen[row] : (ansi_line_age[row] < fade_cycles);
+					if (highlight) {
+						int age = ansi_line_age[row];
+						if (age < 0) age = 0;
+						if (age > fade_cycles) age = fade_cycles;
+						int intensity = (fade_cycles - age) * 255 / fade_cycles;
+						int r = 255;
+						int g = 200;
+						int b = 0;
+						r = r * intensity / 255;
+						g = g * intensity / 255;
+						b = b * intensity / 255;
+						char bg[64];
+						snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", r, g, b);
+						out_line = ansi_apply_background(line, bg);
+					}
+				}
+				if (!out_line)
+					out_line = xstrdup(line);
+
+				ansi_write_line(start_row + row, out_line);
+				free(out_line);
+
+				free(ansi_prev_lines[row]);
+				free(ansi_prev_plain[row]);
+				ansi_prev_lines[row] = xstrdup(line);
+				ansi_prev_plain[row] = plain;
+			}
+			for (int i2 = 0; i2 < line_count; i2++)
+				free(lines[i2]);
+			free(lines);
+
+			if (cmdexit && (flags & WATCH_BEEP))
+				(void)!write(STDOUT_FILENO, "\a", 1);
+			if (cmdexit && (flags & WATCH_ERREXIT)) {
+				ansi_write_line(height - 1, _("command exit with a non-zero status, press a key to exit"));
 				getchar();
-				endwin_exit(cmdexit);
+				ansi_show_cursor();
+				restore_terminal();
+				exit(cmdexit);
+			}
+		} else {
+			reset_ansi();
+			set_ansi_attribute(-1, NULL);
+			if (screen_size_changed) {
+				screen_size_changed = false;  // "atomic" test-and-set
+				endwin();
+				refresh();
+				getmaxyx(stdscr, height, width);
+				resizeterm(height, width);
+				wresize(mainwin, MAIN_HEIGHT, width);
+				first_screen = true;
+			}
+
+			output_lowheader_pre(hdrwin);
+			output_header(hdrwin);
+			t = get_time_usec();
+			if (flags & WATCH_PRECISE)
+				last_tick = t;
+			cmdexit = run_command();
+			if (flags & WATCH_PRECISE)
+				output_lowheader(hdrwin, get_time_usec() - t, cmdexit);
+			else {
+				last_tick = get_time_usec();
+				output_lowheader(hdrwin, last_tick - t, cmdexit);
+			}
+			wrefresh(hdrwin);
+
+			if (cmdexit) {
+				if (flags & WATCH_BEEP)
+					beep();  // doesn't require refresh()
+				if (flags & WATCH_ERREXIT) {
+					// TODO: Hard to see when there's cmd output around it. Add
+					// spaces or move to lowheader.
+					mvwaddstr(mainwin, MAIN_HEIGHT-1, 0, _("command exit with a non-zero status, press a key to exit"));
+					i = fcntl(STDIN_FILENO, F_GETFL);
+					if (i >= 0 && fcntl(STDIN_FILENO, F_SETFL, i|O_NONBLOCK) >= 0) {
+						while (getchar() != EOF) ;
+						fcntl(STDIN_FILENO, F_SETFL, i);
+					}
+					refresh();
+					getchar();
+					endwin_exit(cmdexit);
+				}
 			}
 		}
 
@@ -1407,7 +1868,8 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		wrefresh(mainwin);  // takes some time
+		if (!use_ansi)
+			wrefresh(mainwin);  // takes some time
 		first_screen = false;
 
 		// first process all available input, then respond to
@@ -1428,8 +1890,12 @@ int main(int argc, char *argv[])
 				// all keys idempotent
 				switch (getchar()) {
 				case EOF:
-					if (errno != EINTR)
-						endwin_xerr(1, "getchar()");
+					if (errno != EINTR) {
+						if (use_ansi)
+							err(1, "getchar()");
+						else
+							endwin_xerr(1, "getchar()");
+					}
 					break;
 				case 'q':
 					sleep_dontsleep = sleep_exit = true;
@@ -1438,7 +1904,7 @@ int main(int argc, char *argv[])
 					sleep_dontsleep = true;
 					break;
 				case 's':
-					if (! sleep_scrdumped) {
+					if (! sleep_scrdumped && !use_ansi) {
 						screenshot();
 						sleep_scrdumped = true;
 					}
@@ -1450,5 +1916,10 @@ int main(int argc, char *argv[])
 			break;
 	}
 
+	if (use_ansi) {
+		ansi_show_cursor();
+		restore_terminal();
+		exit(EXIT_SUCCESS);
+	}
 	endwin_exit(EXIT_SUCCESS);
 }
