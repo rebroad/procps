@@ -14,4 +14,4 @@ for i in $(seq 0 25); do
   b=$((255 - r))
   printf "\x1b[38;2;%d;%d;%dm%c " "$r" "$g" "$b" "$((65 + i))"
 done
-printf "\x1b[0mREGULAR TEXT\n"
+printf "\x1b[0m$(date)\n"
