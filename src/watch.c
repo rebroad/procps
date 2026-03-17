@@ -124,6 +124,7 @@ static int ansi_prev_count;
 static uint8_t **ansi_char_age;
 static size_t *ansi_char_age_len;
 static int ansi_fade_cycles = 8;
+static int ansi_fade_fps = 12;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
@@ -475,6 +476,33 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 	return out;
 }
 
+static bool ansi_has_active_fade(void)
+{
+	for (int row = 0; row < ansi_prev_count; row++) {
+		if (!ansi_char_age[row])
+			continue;
+		for (size_t i = 0; i < ansi_char_age_len[row]; i++) {
+			if (ansi_char_age[row][i] < (uint8_t)ansi_fade_cycles)
+				return true;
+		}
+	}
+	return false;
+}
+
+static void ansi_render_current(int start_row)
+{
+	for (int row = 0; row < ansi_prev_count; row++) {
+		const char *line = ansi_prev_lines[row] ? ansi_prev_lines[row] : "";
+		char *out_line = NULL;
+		if ((flags & WATCH_DIFF) && ansi_char_age[row]) {
+			out_line = ansi_apply_char_diff(line, ansi_char_age[row], ansi_char_age_len[row], ansi_fade_cycles);
+		} else {
+			out_line = xstrdup(line);
+		}
+		ansi_write_line(start_row + row, out_line);
+		free(out_line);
+	}
+}
 static void ansi_reset_prev_buffers(int count)
 {
 	for (int i = 0; i < ansi_prev_count; i++) {
@@ -1745,6 +1773,12 @@ int main(int argc, char *argv[])
 			if (v > 0 && v < 1000)
 				ansi_fade_cycles = (int)v;
 		}
+		const char *fps_env = getenv("WATCH_DIFF_FPS");
+		if (fps_env && *fps_env) {
+			long v = strtol(fps_env, NULL, 10);
+			if (v > 0 && v <= 60)
+				ansi_fade_fps = (int)v;
+		}
 	}
 	command_argv = argv + optind;  // for exec*()
 	command_len = strlen(argv[optind]);
@@ -1813,6 +1847,7 @@ int main(int argc, char *argv[])
 	}
 
 	while (1) {
+		watch_usec_t next_render = 0;
 		if (use_ansi) {
 			char **lines = NULL;
 			int line_count = 0;
@@ -1892,6 +1927,8 @@ int main(int argc, char *argv[])
 				ansi_char_age[row] = new_ages;
 				ansi_char_age_len[row] = plen;
 			}
+
+			next_render = get_time_usec() + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
 			for (int i2 = 0; i2 < line_count; i2++)
 				free(lines[i2]);
 			free(lines);
@@ -1980,8 +2017,19 @@ int main(int argc, char *argv[])
 			FD_SET(STDIN_FILENO, &select_stdin);
 			sleep_dontsleep |= screen_size_changed && ! (flags & WATCH_NORERUN);
 			if (! sleep_dontsleep && (t=get_time_usec()-last_tick) < interval) {
-				tosleep.tv_sec = (interval-t) / USECS_PER_SEC;
-				tosleep.tv_usec = (interval-t) % USECS_PER_SEC;
+				watch_usec_t remaining = interval - t;
+				if (use_ansi && (flags & WATCH_DIFF) && !(flags & WATCH_CUMUL) && ansi_has_active_fade()) {
+					watch_usec_t now = get_time_usec();
+					if (now < next_render) {
+						watch_usec_t until_render = next_render - now;
+						if (until_render < remaining)
+							remaining = until_render;
+					} else {
+						remaining = 0;
+					}
+				}
+				tosleep.tv_sec = remaining / USECS_PER_SEC;
+				tosleep.tv_usec = remaining % USECS_PER_SEC;
 			}
 			else memset(&tosleep, 0, sizeof(tosleep));
 			i = select(STDIN_FILENO+1, &select_stdin, NULL, NULL, &tosleep);
@@ -2009,6 +2057,21 @@ int main(int argc, char *argv[])
 						sleep_scrdumped = true;
 					}
 					break;
+				}
+			}
+			if (use_ansi && (flags & WATCH_DIFF) && !(flags & WATCH_CUMUL)) {
+				watch_usec_t now = get_time_usec();
+				if (now >= next_render && ansi_has_active_fade()) {
+					for (int row = 0; row < ansi_prev_count; row++) {
+						if (!ansi_char_age[row])
+							continue;
+						for (size_t i2 = 0; i2 < ansi_char_age_len[row]; i2++) {
+							if (ansi_char_age[row][i2] < (uint8_t)ansi_fade_cycles)
+								ansi_char_age[row][i2]++;
+						}
+					}
+					ansi_render_current((flags & WATCH_NOTITLE) ? 0 : HEADER_HEIGHT);
+					next_render = now + (USECS_PER_SEC / (watch_usec_t)ansi_fade_fps);
 				}
 			}
 		} while (i);
