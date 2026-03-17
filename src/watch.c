@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <locale.h>
 #include <signal.h>
 #include <math.h>
@@ -131,11 +132,18 @@ static int ansi_half_life_seconds = 0;
 static bool ansi_fade_half_life = false;
 static int ansi_fade_half_life_frames = 0;
 static int ansi_fade_max_brightness = 255;
+static int ansi_fade_bg_r = 255;
+static int ansi_fade_bg_g = 200;
+static int ansi_fade_bg_b = 0;
 
 static void restore_terminal(void);
 static void ansi_show_cursor(void);
 static size_t utf8_seq_len(unsigned char c);
 static size_t utf8_count_glyphs(const char *s);
+static bool parse_rgb_env(const char *value, int *r, int *g, int *b);
+static void xterm256_to_rgb(int n, int *r, int *g, int *b);
+static void ansi_update_fg_from_sgr(const char *seq, size_t len, bool *fg_set, int *fr, int *fg, int *fb);
+static void load_watch_prefs(void);
 
 typedef uf64 watch_usec_t;
 #define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
@@ -170,6 +178,7 @@ static void __attribute__ ((__noreturn__)) usage(FILE * out)
 	fputs(_("  -w, --no-wrap          turn off line wrapping\n"), out);
 	fputs(_("  -x, --exec             pass command to exec instead of \"sh -c\"\n"), out);
 	fputs(USAGE_SEPARATOR, out);
+	fputs(_("Configuration file: ~/.watchrc\n"), out);
 	fputs(USAGE_HELP, out);
 	fputs(_(" -v, --version  output version information and exit\n"), out);
 	fprintf(out, USAGE_MAN_TAIL("watch(1)"));
@@ -366,7 +375,7 @@ static void ansi_output_headers(watch_usec_t span, uint8_t exitcode)
 		snprintf(low, sizeof(low), "in %.3Lfs (%" PRIu8 ")", (long double)span / USECS_PER_SEC, exitcode);
 
 	char *line0 = ansi_compose_line(left, right);
-	char *line1 = ansi_compose_line(low, "");
+	char *line1 = ansi_compose_line("", low);
 	ansi_write_line(0, line0);
 	ansi_write_line(1, line1);
 	free(line0);
@@ -428,12 +437,17 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 	char *out = xmalloc(cap);
 	size_t o = 0;
 	size_t vis = 0;
+	bool fg_set = false;
+	int fg_r = 0;
+	int fg_g = 0;
+	int fg_b = 0;
 
 	for (size_t i = 0; i < len; i++) {
 		if (line[i] == '\x1b' && i + 1 < len && line[i + 1] == '[') {
 			out[o++] = line[i];
 			i++;
 			out[o++] = line[i];
+			size_t seq_start = i + 1;
 			while (i + 1 < len && line[i + 1] != 'm') {
 				i++;
 				out[o++] = line[i];
@@ -441,6 +455,7 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 			if (i + 1 < len && line[i + 1] == 'm') {
 				i++;
 				out[o++] = 'm';
+				ansi_update_fg_from_sgr(line + seq_start, i - seq_start, &fg_set, &fg_r, &fg_g, &fg_b);
 			}
 			continue;
 		}
@@ -464,23 +479,45 @@ static char *ansi_apply_char_diff(const char *line, const uint8_t *ages, size_t 
 		}
 		if (highlight) {
 			char bg[64];
-			int r = 255 * intensity / 255;
-			int g = 200 * intensity / 255;
-			int b = 0;
-			int blen = snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", r, g, b);
-			if (o + (size_t)blen + seq + 8 >= cap) {
+			char fg[64];
+			int restore_len = 0;
+			char restore[80];
+			int bg_r = ansi_fade_bg_r * intensity / 255;
+			int bg_g = ansi_fade_bg_g * intensity / 255;
+			int bg_b = ansi_fade_bg_b * intensity / 255;
+			int fg_r_cur = 0;
+			int fg_g_cur = 0;
+			int fg_b_cur = 0;
+			int denom = ansi_fade_max_brightness > 0 ? ansi_fade_max_brightness : 1;
+			int fg_intensity = ansi_fade_max_brightness > 0 ? (ansi_fade_max_brightness - intensity) : 0;
+			if (fg_set) {
+				fg_r_cur = fg_r * fg_intensity / denom;
+				fg_g_cur = fg_g * fg_intensity / denom;
+				fg_b_cur = fg_b * fg_intensity / denom;
+			}
+			if (fg_set)
+				(void)snprintf(fg, sizeof(fg), "\x1b[38;2;%d;%d;%dm", fg_r_cur, fg_g_cur, fg_b_cur);
+			else
+				(void)snprintf(fg, sizeof(fg), "\x1b[30m");
+			(void)snprintf(bg, sizeof(bg), "\x1b[48;2;%d;%d;%dm", bg_r, bg_g, bg_b);
+			if (fg_set)
+				restore_len = snprintf(restore, sizeof(restore), "\x1b[38;2;%d;%d;%dm\x1b[49m", fg_r, fg_g, fg_b);
+			else
+				restore_len = snprintf(restore, sizeof(restore), "\x1b[39m\x1b[49m");
+			size_t fglen = strlen(fg);
+			size_t bglen = strlen(bg);
+			if (o + bglen + fglen + seq + (size_t)restore_len + 8 >= cap) {
 				cap *= 2;
 				out = xrealloc(out, cap);
 			}
-			memcpy(out + o, bg, (size_t)blen);
-			o += (size_t)blen;
+			memcpy(out + o, bg, bglen);
+			o += bglen;
+			memcpy(out + o, fg, fglen);
+			o += fglen;
 			memcpy(out + o, line + i, seq);
 			o += seq;
-			out[o++] = '\x1b';
-			out[o++] = '[';
-			out[o++] = '4';
-			out[o++] = '9';
-			out[o++] = 'm';
+			memcpy(out + o, restore, (size_t)restore_len);
+			o += (size_t)restore_len;
 		} else {
 			if (o + seq + 1 >= cap) {
 				cap *= 2;
@@ -527,6 +564,215 @@ static size_t utf8_count_glyphs(const char *s)
 		count++;
 	}
 	return count;
+}
+
+static bool parse_rgb_env(const char *value, int *r, int *g, int *b)
+{
+	if (!value || !*value)
+		return false;
+	long vals[3] = {0, 0, 0};
+	int found = 0;
+	const char *p = value;
+	while (*p && found < 3) {
+		while (*p && (*p < '0' || *p > '9'))
+			p++;
+		if (!*p)
+			break;
+		char *end = NULL;
+		long v = strtol(p, &end, 10);
+		if (end == p)
+			break;
+		if (v < 0)
+			v = 0;
+		if (v > 255)
+			v = 255;
+		vals[found++] = v;
+		p = end;
+	}
+	if (found == 3) {
+		*r = (int)vals[0];
+		*g = (int)vals[1];
+		*b = (int)vals[2];
+		return true;
+	}
+	return false;
+}
+
+static void xterm256_to_rgb(int n, int *r, int *g, int *b)
+{
+	static const int base16[16][3] = {
+		{0, 0, 0}, {205, 0, 0}, {0, 205, 0}, {205, 205, 0},
+		{0, 0, 238}, {205, 0, 205}, {0, 205, 205}, {229, 229, 229},
+		{127, 127, 127}, {255, 0, 0}, {0, 255, 0}, {255, 255, 0},
+		{92, 92, 255}, {255, 0, 255}, {0, 255, 255}, {255, 255, 255}
+	};
+	if (n < 0)
+		n = 0;
+	if (n > 255)
+		n = 255;
+	if (n < 16) {
+		*r = base16[n][0];
+		*g = base16[n][1];
+		*b = base16[n][2];
+		return;
+	}
+	if (n >= 232) {
+		int gray = 8 + (n - 232) * 10;
+		*r = gray;
+		*g = gray;
+		*b = gray;
+		return;
+	}
+	n -= 16;
+	int ir = n / 36;
+	int ig = (n / 6) % 6;
+	int ib = n % 6;
+	int steps[6] = {0, 95, 135, 175, 215, 255};
+	*r = steps[ir];
+	*g = steps[ig];
+	*b = steps[ib];
+}
+
+static void ansi_update_fg_from_sgr(const char *seq, size_t len, bool *fg_set, int *fr, int *fg, int *fb)
+{
+	if (!seq || len == 0)
+		return;
+	int params[32];
+	int pcount = 0;
+	int cur = -1;
+	for (size_t i = 0; i < len && pcount < (int)(sizeof(params) / sizeof(params[0])); i++) {
+		char c = seq[i];
+		if (c >= '0' && c <= '9') {
+			if (cur < 0)
+				cur = 0;
+			cur = cur * 10 + (c - '0');
+		} else if (c == ';') {
+			if (cur < 0)
+				params[pcount++] = 0;
+			else
+				params[pcount++] = cur;
+			cur = -1;
+		}
+	}
+	if (cur >= 0 && pcount < (int)(sizeof(params) / sizeof(params[0])))
+		params[pcount++] = cur;
+	if (pcount == 0) {
+		params[pcount++] = 0;
+	}
+
+	for (int i = 0; i < pcount; i++) {
+		int code = params[i];
+		if (code == 0 || code == 39) {
+			*fg_set = false;
+			continue;
+		}
+		if (code >= 30 && code <= 37) {
+			xterm256_to_rgb(code - 30, fr, fg, fb);
+			*fg_set = true;
+			continue;
+		}
+		if (code >= 90 && code <= 97) {
+			xterm256_to_rgb(code - 90 + 8, fr, fg, fb);
+			*fg_set = true;
+			continue;
+		}
+		if (code == 38) {
+			if (i + 1 < pcount && params[i + 1] == 2 && i + 4 < pcount) {
+				*fr = params[i + 2];
+				*fg = params[i + 3];
+				*fb = params[i + 4];
+				*fg_set = true;
+				i += 4;
+				continue;
+			}
+			if (i + 1 < pcount && params[i + 1] == 5 && i + 2 < pcount) {
+				xterm256_to_rgb(params[i + 2], fr, fg, fb);
+				*fg_set = true;
+				i += 2;
+				continue;
+			}
+		}
+	}
+}
+
+static void load_watch_prefs(void)
+{
+	const char *home = getenv("HOME");
+	char path[PATH_MAX];
+	const char *candidates[1];
+	int idx = 0;
+	if (home && *home) {
+		snprintf(path, sizeof(path), "%s/.watchrc", home);
+		candidates[idx++] = path;
+	}
+
+	const char *cfg = NULL;
+	for (int i = 0; i < idx; i++) {
+		if (candidates[i] && access(candidates[i], R_OK) == 0) {
+			cfg = candidates[i];
+			break;
+		}
+	}
+
+	if (!cfg)
+		return;
+
+	FILE *fp = fopen(cfg, "r");
+	if (!fp)
+		return;
+
+	char line[512];
+	while (fgets(line, sizeof(line), fp)) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '\0' || *p == '\n' || *p == '#')
+			continue;
+		char *eq = strchr(p, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		char *key = p;
+		char *val = eq + 1;
+		char *end = key + strlen(key);
+		while (end > key && (end[-1] == ' ' || end[-1] == '\t'))
+			*--end = '\0';
+		while (*val == ' ' || *val == '\t')
+			val++;
+		end = val + strlen(val);
+		while (end > val && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
+			*--end = '\0';
+
+		if (*key == '\0' || *val == '\0')
+			continue;
+
+		if (strncasecmp(key, "watch_", 6) == 0)
+			key += 6;
+
+		if (strcasecmp(key, "fade") == 0) {
+			long v = strtol(val, NULL, 10);
+			if (v > 0 && v < 1000)
+				ansi_fade_seconds = (int)v;
+		} else if (strcasecmp(key, "half_life") == 0) {
+			long v = strtol(val, NULL, 10);
+			if (v > 0 && v < 1000)
+				ansi_half_life_seconds = (int)v;
+		} else if (strcasecmp(key, "fps") == 0) {
+			long v = strtol(val, NULL, 10);
+			if (v > 0 && v <= 60)
+				ansi_fade_fps = (int)v;
+		} else if (strcasecmp(key, "fade_max") == 0) {
+			long v = strtol(val, NULL, 10);
+			if (v < 0)
+				v = 0;
+			if (v > 255)
+				v = 255;
+			ansi_fade_max_brightness = (int)v;
+		} else if (strcasecmp(key, "fade_bg") == 0) {
+			(void)parse_rgb_env(val, &ansi_fade_bg_r, &ansi_fade_bg_g, &ansi_fade_bg_b);
+		}
+	}
+	fclose(fp);
 }
 
 static bool ansi_has_active_fade(void)
@@ -1697,6 +1943,7 @@ int main(int argc, char *argv[])
 	struct timeval tosleep;
 	bool sleep_dontsleep, sleep_scrdumped, sleep_exit;
 	WINDOW *hdrwin = NULL;
+	bool ansi_exit_newline = false;
 	const struct option longopts[] = {
 		{"color", no_argument, 0, 'c'},
 		{"no-color", no_argument, 0, 'C'},
@@ -1820,6 +2067,7 @@ int main(int argc, char *argv[])
 	use_ansi = color_option_seen && color_explicit && (flags & WATCH_COLOR);
 	use_pty = (flags & WATCH_COLOR);
 	if (use_ansi) {
+		load_watch_prefs();
 		const char *fade_env = getenv("WATCH_FADE");
 		if (fade_env && *fade_env) {
 			long v = strtol(fade_env, NULL, 10);
@@ -1846,6 +2094,10 @@ int main(int argc, char *argv[])
 			if (v > 255)
 				v = 255;
 			ansi_fade_max_brightness = (int)v;
+		}
+		const char *bg_env = getenv("WATCH_FADE_BG");
+		if (bg_env && *bg_env) {
+			(void)parse_rgb_env(bg_env, &ansi_fade_bg_r, &ansi_fade_bg_g, &ansi_fade_bg_b);
 		}
 		if (ansi_half_life_seconds > 0) {
 			ansi_fade_half_life = true;
@@ -2159,6 +2411,8 @@ int main(int argc, char *argv[])
 					break;
 				case 'q':
 					sleep_dontsleep = sleep_exit = true;
+					if (use_ansi)
+						ansi_exit_newline = true;
 					break;
 				case ' ':
 					sleep_dontsleep = true;
@@ -2201,6 +2455,8 @@ int main(int argc, char *argv[])
 	}
 
 	if (use_ansi) {
+		if (ansi_exit_newline)
+			(void)!write(STDOUT_FILENO, "\n", 1);
 		ansi_show_cursor();
 		restore_terminal();
 		exit(EXIT_SUCCESS);
