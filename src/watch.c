@@ -52,6 +52,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <pty.h>
 #include "c.h"
 #include "config.h"
 #include "fileutils.h"
@@ -108,6 +109,7 @@ static char *command;
 static size_t command_len;
 static char *const *command_argv;
 static const char *shotsdir = "";
+static bool use_pty;
 
 #define MAIN_HEIGHT (height - (flags & WATCH_NOTITLE?0:HEADER_HEIGHT))
 
@@ -173,6 +175,20 @@ static void reset_ansi(void)
 	bg_col = 0;
 }
 
+static uf8 rgb_to_ansi256(int r, int g, int b)
+{
+	if (r == g && g == b) {
+		if (r < 8)
+			return 16;
+		if (r > 248)
+			return 231;
+		return 232 + (r - 8) / 10;
+	}
+	int ir = (r * 5 + 127) / 255;
+	int ig = (g * 5 + 127) / 255;
+	int ib = (b * 5 + 127) / 255;
+	return 16 + 36 * ir + 6 * ig + ib;
+}
 
 
 static void init_ansi_colors(void)
@@ -250,7 +266,7 @@ static uf8 process_ansi_color_escape_sequence(char **const escape_sequence) {
 	// 38;5;⟨n⟩  (set fg color to n)
 	// 48;5;⟨n⟩  (set bg color to n)
 	//
-	// Eg 24-bit (not yet implemented)
+	// Eg 24-bit (mapped to nearest 256-color entry)
 	// ESC[ 38;2;⟨r⟩;⟨g⟩;⟨b⟩ m Select RGB foreground color
 	// ESC[ 48;2;⟨r⟩;⟨g⟩;⟨b⟩ m Select RGB background color
 
@@ -277,8 +293,33 @@ static uf8 process_ansi_color_escape_sequence(char **const escape_sequence) {
 		//                                       (0 ≤ r, g, b ≤ 5)
 		// 232-255:  grayscale from black to white in 24 steps
 #ifdef WITH_WATCH8BIT
-                if (num > 15 && num < 256)
-                    return more_colors ? num + 1 : 0;
+		if (num > 15 && num < 256)
+			return more_colors ? num + 1 : 0;
+#endif
+	}
+
+	if ((*escape_sequence)[1] == '2') {
+		if ((*escape_sequence)[2] != ';')
+			return 0; /* not understood */
+		char *p = (*escape_sequence) + 3;
+		long r = strtol(p, &p, 10);
+		if (*p != ';')
+			return 0; /* not understood */
+		long g = strtol(p + 1, &p, 10);
+		if (*p != ';')
+			return 0; /* not understood */
+		long b = strtol(p + 1, escape_sequence, 10);
+		if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255)
+			return 0; /* not understood */
+
+		uf8 num = rgb_to_ansi256((int)r, (int)g, (int)b);
+		if (num <= 7)
+			return num + 1;
+		if (num <= 15)
+			return more_colors ? num + 1 : num - 8 + 1;
+#ifdef WITH_WATCH8BIT
+		if (num < 256)
+			return more_colors ? num + 1 : 0;
 #endif
 	}
 
@@ -931,28 +972,44 @@ static bool my_clrtobot(int y, int x)
 static uint8_t run_command(void)
 {
 	int pipefd[2], status;  // [0] = output, [1] = input
-	if (pipe(pipefd) < 0)
-		endwin_xerr(2, _("unable to create IPC pipes"));
+	int outfd;
+	pid_t child;
 	// child will share buffered data, will print it at fclose()
 	fflush(stdout);
 	fflush(stderr);
 
-	pid_t child = fork();
-	if (child < 0)
-		endwin_xerr(2, _("unable to fork process"));
-	else if (child == 0) {  /* in child */
+	if (use_pty) {
+		struct winsize ws;
+		memset(&ws, 0, sizeof(ws));
+		ws.ws_row = MAIN_HEIGHT;
+		ws.ws_col = width;
+		child = forkpty(&outfd, NULL, NULL, &ws);
+		if (child < 0)
+			endwin_xerr(2, _("unable to fork process"));
+	} else {
+		if (pipe(pipefd) < 0)
+			endwin_xerr(2, _("unable to create IPC pipes"));
+		child = fork();
+		if (child < 0)
+			endwin_xerr(2, _("unable to fork process"));
+		outfd = pipefd[0];
+	}
+
+	if (child == 0) {  /* in child */
 		// stdout/err can't be used here. Avoid xerr(), close_stdout(), ...
 		// fclose() so as not to confuse _Exit().
 		fclose(stdout);
 		fclose(stderr);
-		// connect out and err up with pipe input
-		while (close(pipefd[0]) == -1 && errno == EINTR) ;
-		while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
-		while (close(pipefd[1]) == -1 && errno == EINTR) ;
-		while (dup2(STDOUT_FILENO, STDERR_FILENO) == -1 && errno == EINTR) ;
-		// TODO: 0 left open. Is that intentional? I suppose the application
-		// might conclude it's run interactively (see ps). And hang if it should
-		// wait for input (watch 'read A; echo $A').
+		if (!use_pty) {
+			// connect out and err up with pipe input
+			while (close(pipefd[0]) == -1 && errno == EINTR) ;
+			while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
+			while (close(pipefd[1]) == -1 && errno == EINTR) ;
+			while (dup2(STDOUT_FILENO, STDERR_FILENO) == -1 && errno == EINTR) ;
+			// TODO: 0 left open. Is that intentional? I suppose the application
+			// might conclude it's run interactively (see ps). And hang if it should
+			// wait for input (watch 'read A; echo $A').
+		}
 
 		if (flags & WATCH_EXEC) {
 			execvp(command_argv[0], command_argv);
@@ -982,8 +1039,9 @@ static uint8_t run_command(void)
 	}
 	/* otherwise, we're in parent */
 
-	while (close(pipefd[1]) == -1 && errno == EINTR) ;
-	FILE *p = fdopen(pipefd[0], "r");
+	if (!use_pty)
+		while (close(pipefd[1]) == -1 && errno == EINTR) ;
+	FILE *p = fdopen(outfd, "r");
 	if (! p)
 		endwin_xerr(2, _("fdopen"));
 	setvbuf(p, NULL, _IOFBF, BUFSIZ);  // We'll getc() from it. A lot.
@@ -1228,6 +1286,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, _("Follow -f option conflicts with change options -d,-e or -q"));
             usage(stderr);
         }
+	use_pty = (flags & WATCH_COLOR);
 	command_argv = argv + optind;  // for exec*()
 	command_len = strlen(argv[optind]);
 	command = xmalloc(command_len+1);  // never freed
