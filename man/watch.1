@@ -91,6 +91,11 @@ Turn off the header normally shown at the top of the screen.
 Turn off line wrapping. Long lines will be truncated instead of wrapped to the
 next line.
 .TP
+\fB\-\-pty\fR
+Run \fIcommand\fR in a pseudo-terminal (PTY). This can make programs emit ANSI
+color sequences or adjust output formatting as if they were attached to a real
+terminal.
+.TP
 \fB\-x\fR, \fB\-\-exec\fR
 Pass \fIcommand\fR to an
 .BR exec (3)

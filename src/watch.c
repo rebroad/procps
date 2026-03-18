@@ -46,6 +46,7 @@
 #include <inttypes.h>
 #include <locale.h>
 #include <signal.h>
+#include <pty.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -97,6 +98,7 @@
 #define WATCH_NOWRAP   (1 << 10)
 #define WATCH_NOTITLE  (1 << 11)
 #define WATCH_FOLLOW   (1 << 12)
+#define WATCH_PTY      (1 << 13)
 // Do we care about screen contents changes at all?
 #define WATCH_ALL_DIFF (WATCH_DIFF | WATCH_CHGEXIT | WATCH_EQUEXIT)
 
@@ -137,6 +139,7 @@ static void __attribute__ ((__noreturn__)) usage(FILE * out)
 	fputs(_("  -s, --shotsdir         directory to store screenshots\n"), out);  // TODO: gettext
 	fputs(_("  -t, --no-title         turn off header\n"), out);
 	fputs(_("  -w, --no-wrap          turn off line wrapping\n"), out);
+	fputs(_("      --pty              run command in a PTY\n"), out);
 	fputs(_("  -x, --exec             pass command to exec instead of \"sh -c\"\n"), out);
 	fputs(USAGE_SEPARATOR, out);
 	fputs(USAGE_HELP, out);
@@ -244,6 +247,27 @@ static void init_ansi_colors(void)
 
 
 
+static int rgb_to_xterm256(int r, int g, int b)
+{
+	if (r < 0) r = 0; if (r > 255) r = 255;
+	if (g < 0) g = 0; if (g > 255) g = 255;
+	if (b < 0) b = 0; if (b > 255) b = 255;
+
+	if (r == g && g == b) {
+		if (r < 8) return 16;
+		if (r > 248) return 231;
+		return 232 + (r - 8) / 10;
+	}
+
+	int ri = (r + 25) / 51;
+	int gi = (g + 25) / 51;
+	int bi = (b + 25) / 51;
+	if (ri > 5) ri = 5;
+	if (gi > 5) gi = 5;
+	if (bi > 5) bi = 5;
+	return 16 + 36 * ri + 6 * gi + bi;
+}
+
 static uf8 process_ansi_color_escape_sequence(char **const escape_sequence) {
 	// process SGR ANSI color escape sequence
 	// Eg 8-bit
@@ -279,6 +303,28 @@ static uf8 process_ansi_color_escape_sequence(char **const escape_sequence) {
 #ifdef WITH_WATCH8BIT
                 if (num > 15 && num < 256)
                     return more_colors ? num + 1 : 0;
+#endif
+	}
+	if ((*escape_sequence)[1] == '2') {
+		// 24-bit: ;2;<r>;<g>;<b>
+		if ((*escape_sequence)[2] != ';')
+			return 0; /* not understood */
+		char *p = (*escape_sequence) + 3;
+		long r = strtol(p, &p, 10);
+		if (*p != ';') return 0;
+		long g = strtol(p + 1, &p, 10);
+		if (*p != ';') return 0;
+		long b = strtol(p + 1, escape_sequence, 10);
+		int num = rgb_to_xterm256((int)r, (int)g, (int)b);
+#ifdef WITH_WATCH8BIT
+		return more_colors ? (uf8)(num + 1) : 0;
+#else
+		// If limited to 8 colors, map to closest basic color.
+		if (!more_colors) {
+			int avg = (int)((r + g + b) / 3);
+			return (uf8)((avg > 127) ? 8 : 1); // bright/normal approx
+		}
+		return (uf8)(num + 1);
 #endif
 	}
 
@@ -930,26 +976,45 @@ static bool my_clrtobot(int y, int x)
 // -D_XOPEN_SOURCE=600 and an EINTR loop around every fclose() as well.
 static uint8_t run_command(void)
 {
-	int pipefd[2], status;  // [0] = output, [1] = input
-	if (pipe(pipefd) < 0)
-		endwin_xerr(2, _("unable to create IPC pipes"));
+	int pipefd[2] = {-1, -1}, status;  // [0] = output, [1] = input
+	int outfd = -1;
+	struct winsize ws;
+	struct winsize *wsp = NULL;
+
+	if (flags & WATCH_PTY) {
+		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
+			wsp = &ws;
+	} else {
+		if (pipe(pipefd) < 0)
+			endwin_xerr(2, _("unable to create IPC pipes"));
+	}
 	// child will share buffered data, will print it at fclose()
 	fflush(stdout);
 	fflush(stderr);
 
-	pid_t child = fork();
-	if (child < 0)
-		endwin_xerr(2, _("unable to fork process"));
-	else if (child == 0) {  /* in child */
-		// stdout/err can't be used here. Avoid xerr(), close_stdout(), ...
-		// fclose() so as not to confuse _Exit().
-		fclose(stdout);
-		fclose(stderr);
-		// connect out and err up with pipe input
-		while (close(pipefd[0]) == -1 && errno == EINTR) ;
-		while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
-		while (close(pipefd[1]) == -1 && errno == EINTR) ;
-		while (dup2(STDOUT_FILENO, STDERR_FILENO) == -1 && errno == EINTR) ;
+	pid_t child;
+	if (flags & WATCH_PTY) {
+		child = forkpty(&outfd, NULL, NULL, wsp);
+		if (child < 0)
+			endwin_xerr(2, _("unable to fork process"));
+	} else {
+		child = fork();
+		if (child < 0)
+			endwin_xerr(2, _("unable to fork process"));
+	}
+
+	if (child == 0) {  /* in child */
+		if (!(flags & WATCH_PTY)) {
+			// stdout/err can't be used here. Avoid xerr(), close_stdout(), ...
+			// fclose() so as not to confuse _Exit().
+			fclose(stdout);
+			fclose(stderr);
+			// connect out and err up with pipe input
+			while (close(pipefd[0]) == -1 && errno == EINTR) ;
+			while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
+			while (close(pipefd[1]) == -1 && errno == EINTR) ;
+			while (dup2(STDOUT_FILENO, STDERR_FILENO) == -1 && errno == EINTR) ;
+		}
 		// TODO: 0 left open. Is that intentional? I suppose the application
 		// might conclude it's run interactively (see ps). And hang if it should
 		// wait for input (watch 'read A; echo $A').
@@ -982,8 +1047,15 @@ static uint8_t run_command(void)
 	}
 	/* otherwise, we're in parent */
 
-	while (close(pipefd[1]) == -1 && errno == EINTR) ;
-	FILE *p = fdopen(pipefd[0], "r");
+	if (!(flags & WATCH_PTY))
+		while (close(pipefd[1]) == -1 && errno == EINTR) ;
+	if (flags & WATCH_PTY) {
+		if (outfd < 0)
+			endwin_xerr(2, _("unable to create PTY"));
+	} else {
+		outfd = pipefd[0];
+	}
+	FILE *p = fdopen(outfd, "r");
 	if (! p)
 		endwin_xerr(2, _("fdopen"));
 	setvbuf(p, NULL, _IOFBF, BUFSIZ);  // We'll getc() from it. A lot.
@@ -1129,6 +1201,7 @@ int main(int argc, char *argv[])
 		{"shotsdir", required_argument, 0, 's'},
 		{"no-title", no_argument, 0, 't'},
 		{"no-wrap", no_argument, 0, 'w'},
+		{"pty", no_argument, 0, 1000},
 		{"version", no_argument, 0, 'v'},
 		{0}
 	};
@@ -1199,6 +1272,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'w':
 			flags |= WATCH_NOWRAP;
+			break;
+		case 1000:
+			flags |= WATCH_PTY;
 			break;
 		case 'x':
 			flags |= WATCH_EXEC;
