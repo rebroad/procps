@@ -220,7 +220,7 @@ src_hugetop_LDADD = $(LDADD) @NCURSES_LIBS@
 endif
 src_watch_SOURCES = src/watch.c local/strutils.c local/fileutils.c local/signals.c
 src_watch_CFLAGS = @NCURSES_CFLAGS@
-src_watch_LDADD = @NCURSES_LIBS@ $(CYGWINFLAGS) -lm
+src_watch_LDADD = @NCURSES_LIBS@ $(CYGWINFLAGS) -lm -lutil
 src_top_top_SOURCES = \
 	src/top/top.h \
 	src/top/top.c \

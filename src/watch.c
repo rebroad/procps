@@ -124,8 +124,6 @@ static bool color_explicit;
 static volatile sig_atomic_t ansi_exit_newline = 0;
 static char **ansi_prev_lines;
 static char **ansi_prev_plain;
-static int *ansi_line_age;
-static bool *ansi_line_seen;
 static int ansi_prev_count;
 static int16_t **ansi_char_age;
 static size_t *ansi_char_age_len;
@@ -432,52 +430,6 @@ static void ansi_output_headers(watch_usec_t span, uint8_t exitcode)
 	ansi_write_line(1, line1);
 	free(line0);
 	free(line1);
-}
-
-static char *ansi_apply_background(const char *line, const char *bg)
-{
-	if (!bg || !*bg)
-		return xstrdup(line ? line : "");
-	size_t len = line ? strlen(line) : 0;
-	size_t bglen = strlen(bg);
-	size_t cap = len * 4 + bglen * 8 + 32;
-	char *out = xmalloc(cap);
-	size_t o = 0;
-	if (bglen) {
-		memcpy(out + o, bg, bglen);
-		o += bglen;
-	}
-	for (size_t i = 0; i < len; i++) {
-		out[o++] = line[i];
-		if (line[i] == '\x1b' && i + 1 < len && line[i + 1] == '[') {
-			i += 1;
-			out[o++] = line[i];
-			while (i + 1 < len && line[i + 1] != 'm') {
-				i++;
-				out[o++] = line[i];
-			}
-			if (i + 1 < len && line[i + 1] == 'm') {
-				i++;
-				out[o++] = 'm';
-				if (bglen) {
-					memcpy(out + o, bg, bglen);
-					o += bglen;
-				}
-			}
-		}
-		if (o + bglen + 8 >= cap) {
-			cap *= 2;
-			out = xrealloc(out, cap);
-		}
-	}
-	if (o + 4 < cap) {
-		out[o++] = '\x1b';
-		out[o++] = '[';
-		out[o++] = '0';
-		out[o++] = 'm';
-	}
-	out[o] = '\0';
-	return out;
 }
 
 static char *ansi_apply_char_diff(const char *line, const int16_t *ages, size_t age_len, int fade_cycles)
@@ -1419,8 +1371,6 @@ static void ansi_reset_prev_buffers(int count)
 	}
 	free(ansi_prev_lines);
 	free(ansi_prev_plain);
-	free(ansi_line_age);
-	free(ansi_line_seen);
 	free(ansi_char_age);
 	free(ansi_char_age_len);
 	free(ansi_pending_lines);
@@ -1433,8 +1383,6 @@ static void ansi_reset_prev_buffers(int count)
 	ansi_pending_step = 0;
 	ansi_prev_lines = xcalloc((size_t)count, sizeof(*ansi_prev_lines));
 	ansi_prev_plain = xcalloc((size_t)count, sizeof(*ansi_prev_plain));
-	ansi_line_age = xcalloc((size_t)count, sizeof(*ansi_line_age));
-	ansi_line_seen = xcalloc((size_t)count, sizeof(*ansi_line_seen));
 	ansi_char_age = xcalloc((size_t)count, sizeof(*ansi_char_age));
 	ansi_char_age_len = xcalloc((size_t)count, sizeof(*ansi_char_age_len));
 	ansi_pending_lines = xcalloc((size_t)count, sizeof(*ansi_pending_lines));
@@ -2290,14 +2238,20 @@ static bool my_clrtobot(int y, int x)
 //
 // Make sure not to leak system resources (incl. fds, processes). Suggesting
 // -D_XOPEN_SOURCE=600 and an EINTR loop around every fclose() as well.
-static uint8_t run_command(void)
+typedef struct {
+	FILE *fp;
+	pid_t pid;
+} watch_child_stream;
+
+static watch_child_stream spawn_command_stream(bool use_ncurses)
 {
-	int pipefd[2], status;  // [0] = output, [1] = input
+	watch_child_stream stream;
+	stream.fp = NULL;
+	stream.pid = -1;
+
+	int pipefd[2] = { -1, -1 };
 	int outfd;
 	pid_t child;
-	// child will share buffered data, will print it at fclose()
-	fflush(stdout);
-	fflush(stderr);
 
 	if (use_pty) {
 		struct winsize ws;
@@ -2341,7 +2295,7 @@ static uint8_t run_command(void)
 			(void)!write(STDERR_FILENO, errmsg, strlen(errmsg));
 			_Exit(0x7f);  // sort of like sh
 		}
-		status = system(command);
+		int status = system(command);
 		// errno from system() not guaranteed
 		// -1 = error from system() (exec(), wait(), ...), not command
 		if (status == -1) {
@@ -2363,9 +2317,29 @@ static uint8_t run_command(void)
 	if (!use_pty)
 		while (close(pipefd[1]) == -1 && errno == EINTR) ;
 	FILE *p = fdopen(outfd, "r");
-	if (! p)
-		endwin_xerr(2, _("fdopen"));
+	if (!p) {
+		if (use_ncurses)
+			endwin_xerr(2, _("fdopen"));
+		else
+			err(2, _("fdopen"));
+	}
 	setvbuf(p, NULL, _IOFBF, BUFSIZ);  // We'll getc() from it. A lot.
+
+	stream.fp = p;
+	stream.pid = child;
+	return stream;
+}
+
+static uint8_t run_command(void)
+{
+	int status;
+	// child will share buffered data, will print it at fclose()
+	fflush(stdout);
+	fflush(stderr);
+
+	watch_child_stream stream = spawn_command_stream(true);
+	FILE *p = stream.fp;
+	pid_t child = stream.pid;
 
 	Xint c, carry = XEOF;
 	int cwid, y, x;  // cwid = character width in terminal columns
@@ -2483,65 +2457,14 @@ static uint8_t run_command(void)
 
 static uint8_t run_command_ansi(char ***out_lines, int max_lines, int *out_count)
 {
-	int pipefd[2], status;
-	int outfd;
-	pid_t child;
+	int status;
 	fflush(stdout);
 	fflush(stderr);
 
-	if (use_pty) {
-		struct winsize ws;
-		memset(&ws, 0, sizeof(ws));
-		ws.ws_row = MAIN_HEIGHT;
-		ws.ws_col = width;
-		child = forkpty(&outfd, NULL, NULL, &ws);
-		if (child < 0)
-			err(2, _("unable to fork process"));
-	} else {
-		if (pipe(pipefd) < 0)
-			err(2, _("unable to create IPC pipes"));
-		child = fork();
-		if (child < 0)
-			err(2, _("unable to fork process"));
-		outfd = pipefd[0];
-	}
+	watch_child_stream stream = spawn_command_stream(false);
+	FILE *p = stream.fp;
+	pid_t child = stream.pid;
 
-	if (child == 0) {
-		if (!use_pty) {
-			fclose(stdout);
-			fclose(stderr);
-			while (close(pipefd[0]) == -1 && errno == EINTR) ;
-			while (dup2(pipefd[1], STDOUT_FILENO) == -1 && errno == EINTR) ;
-			while (close(pipefd[1]) == -1 && errno == EINTR) ;
-			while (dup2(STDOUT_FILENO, STDERR_FILENO) == -1 && errno == EINTR) ;
-		}
-
-		if (flags & WATCH_EXEC) {
-			execvp(command_argv[0], command_argv);
-			const char *const errmsg = strerror(errno);
-			(void)!write(STDERR_FILENO, command_argv[0], strlen(command_argv[0]));
-			(void)!write(STDERR_FILENO, ": ", 2);
-			(void)!write(STDERR_FILENO, errmsg, strlen(errmsg));
-			_Exit(0x7f);
-		}
-		status = system(command);
-		if (status == -1) {
-			(void)!write(STDERR_FILENO, command, command_len);
-			(void)!write(STDERR_FILENO, ": unable to run", 15);
-			_Exit(0x7f);
-		}
-		if (WIFEXITED(status))
-			_Exit(WEXITSTATUS(status));
-		assert(WIFSIGNALED(status));
-		_Exit(0x80 + (WTERMSIG(status) & 0x7f));
-	}
-
-	if (!use_pty)
-		while (close(pipefd[1]) == -1 && errno == EINTR) ;
-	FILE *p = fdopen(outfd, "r");
-	if (!p)
-		err(2, _("fdopen"));
-	setvbuf(p, NULL, _IOFBF, BUFSIZ);
 	*out_lines = ansi_read_lines(p, max_lines, out_count);
 	fclose(p);
 
@@ -2686,6 +2609,8 @@ int main(int argc, char *argv[])
             usage(stderr);
         }
 	use_ansi = color_option_seen && color_explicit && (flags & WATCH_COLOR);
+	// Keep PTY when color is enabled so commands detect a tty and emit color
+	// sequences that watch can interpret, even if we don't use the ANSI renderer.
 	use_pty = (flags & WATCH_COLOR);
 	if (use_ansi) {
 		load_default_fg_from_env();
