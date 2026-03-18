@@ -574,7 +574,8 @@ static char *ansi_apply_char_diff(const char *line, const int16_t *ages, size_t 
 				? (0.2126 * orig_fg_r + 0.7152 * orig_fg_g + 0.0722 * orig_fg_b)
 				: 0.0;
 			bool snap_fg = have_orig_fg && bg_luma < (fg_luma * 0.5);
-			if (snap_fg) {
+			bool allow_black = ratio >= 0.5;
+			if (snap_fg || !allow_black) {
 				(void)snprintf(fg, sizeof(fg), "\x1b[38;2;%d;%d;%dm", orig_fg_r, orig_fg_g, orig_fg_b);
 			} else {
 				(void)snprintf(fg, sizeof(fg), "\x1b[30m");
