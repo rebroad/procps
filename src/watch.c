@@ -99,6 +99,7 @@
 #define WATCH_NOTITLE  (1 << 11)
 #define WATCH_FOLLOW   (1 << 12)
 #define WATCH_PTY      (1 << 13)
+#define WATCH_PREVIEW  (1 << 14)
 // Do we care about screen contents changes at all?
 #define WATCH_ALL_DIFF (WATCH_DIFF | WATCH_CHGEXIT | WATCH_EQUEXIT)
 
@@ -113,7 +114,27 @@ static const char *shotsdir = "";
 
 #define MAIN_HEIGHT (height - (flags & WATCH_NOTITLE?0:HEADER_HEIGHT))
 
-WINDOW *mainwin;
+WINDOW *win_cur;
+static WINDOW *outwin;
+static WINDOW *compare_win;
+static bool *diff_mask;
+static size_t diff_mask_len;
+static bool diff_mask_any;
+
+typedef uf64 watch_usec_t;
+#define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
+
+typedef struct {
+	bool pending;
+	WINDOW *nextwin;
+	bool *mask;
+	size_t mask_len;
+	watch_usec_t switch_time;
+	watch_usec_t span;
+	uint8_t exitcode;
+} preview_state_t;
+
+static preview_state_t preview_state;
 
 // don't use EXIT_FAILURE, it can be anything and manpage makes guarantees about
 // exitcodes
@@ -415,9 +436,9 @@ static bool set_ansi_attribute(const int attrib, char** escape_sequence)
 			return false; /* Not understood */
 		}
 	}
-    int c = bg_col * nr_of_colors + fg_col + 1;
-    wattr_set(mainwin, attributes, 0, &c);
-    return true;
+	int c = bg_col * nr_of_colors + fg_col + 1;
+	wattr_set(outwin, attributes, 0, &c);
+	return true;
 }
 
 
@@ -477,9 +498,6 @@ static void process_ansi(FILE * fp)
 }
 
 
-
-typedef uf64 watch_usec_t;
-#define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
 
 static inline watch_usec_t get_time_usec(void)
 {
@@ -561,9 +579,9 @@ static void screenshot(void) {
 	char *const buf = xmalloc(bufsize);
 
 	int yin, xout, tmpy, tmpx;
-        getyx(mainwin, tmpy, tmpx);
+	getyx(win_cur, tmpy, tmpx);
 	for (int y=0; y<tmpy; ++y) {
-		yin = mvwinnstr(mainwin, y, 0, buf, bufsize-1);
+		yin = mvwinnstr(win_cur, y, 0, buf, bufsize-1);
 		if (yin == ERR)  // screen resized
 			yin = 0;
 		buf[yin] = '\n';
@@ -573,7 +591,7 @@ static void screenshot(void) {
 				endwin_xerr(1, "write(%s)", dumpfile);
 		}
 	}
-        wmove(mainwin, tmpy, tmpx);
+	wmove(win_cur, tmpy, tmpx);
 	free(buf);
 
 	if (close(f) == -1)
@@ -797,6 +815,7 @@ static bool display_char(int y, int x, Xint c, int cwid) {
 	assert(width-x >= cwid);  // fits
 	bool changed = false;
 	bool old_standout = false;
+	bool highlight = false;
 
 #ifdef WITH_WATCH8BIT
 // there's an array on stack the size of a function of this
@@ -826,7 +845,7 @@ static bool display_char(int y, int x, Xint c, int cwid) {
 			// 日a -> a日a (日 highlighted because of change in its 2nd column).
 			for (i=0; i<cwid; ++i) {
 				// terrible interface, so much copying
-				mvwin_wch(mainwin, y, x+i, &cc);  // c fits => ok
+				mvwin_wch(compare_win, y, x+i, &cc);  // c fits => ok
 				getcchar(&cc, oldcc[i], &attr, &dummy, NULL);
 				oldstnd |= attr & A_STANDOUT;
 				oldcclen[i] = wcslen(oldcc[i]);
@@ -870,17 +889,17 @@ static bool display_char(int y, int x, Xint c, int cwid) {
 	}
 
         if (!(flags & WATCH_FOLLOW))
-	        wmove(mainwin, y, x);
+			wmove(outwin, y, x);
 	if (cwid > 0) {
 		wchar_t c2 = c;
-		waddnwstr(mainwin, &c2, 1);
+		waddnwstr(outwin, &c2, 1);
 	}
 	else {
 		cchar_t cc;
 		wchar_t wcs[CCHARW_MAX];
 		short dummy;
 		attr_t dummy2;
-		win_wch(mainwin,&cc);
+		win_wch(outwin,&cc);
 		getcchar(&cc, wcs, &dummy2, &dummy, NULL);
 		uf8 len = wcslen(wcs);
 		if (len < CCHARW_MAX - 1) {
@@ -888,29 +907,45 @@ static bool display_char(int y, int x, Xint c, int cwid) {
 			wcs[len+1] = L'\0';
 		}
 		setcchar(&cc, wcs, dummy2, dummy, NULL);
-		wadd_wch(mainwin, &cc);
+		wadd_wch(outwin, &cc);
 	}
 #else
 	if (! first_screen && flags&WATCH_ALL_DIFF) {
-		chtype oldc = mvwinch(mainwin, y, x);
+		chtype oldc = mvwinch(compare_win, y, x);
 		changed = (unsigned char)c != (oldc & A_CHARTEXT);
 		old_standout = oldc & A_STANDOUT;
 	}
 
-	wmove(mainwin,y, x);
-	waddch(mainwin, c);
+	wmove(outwin,y, x);
+	waddch(outwin, c);
 #endif
 
 	if (flags & WATCH_DIFF) {
 		attr_t newattr;
 		short newcolor;
-		wattr_get(mainwin, &newattr, &newcolor, NULL);
+		wattr_get(outwin, &newattr, &newcolor, NULL);
 		// standout can flip on/off as the components of a compound char arrive
 
-		if (changed || (flags&WATCH_CUMUL && old_standout))
-			mvwchgat(mainwin, y, x, 1, newattr | A_STANDOUT, newcolor, NULL);
+		highlight = (changed || (flags&WATCH_CUMUL && old_standout));
+		if (highlight)
+			mvwchgat(outwin, y, x, 1, newattr | A_STANDOUT, newcolor, NULL);
 		else
-			mvwchgat(mainwin, y, x, 1, newattr & ~(attr_t)A_STANDOUT, newcolor, NULL);
+			mvwchgat(outwin, y, x, 1, newattr & ~(attr_t)A_STANDOUT, newcolor, NULL);
+	}
+
+	if (diff_mask && highlight) {
+		if (y >= 0 && y < MAIN_HEIGHT && x >= 0 && x < width) {
+			int span = cwid > 0 ? cwid : 1;
+			for (int i = 0; i < span; i++) {
+				int xi = x + i;
+				if (xi >= 0 && xi < width) {
+					size_t idx = (size_t)y * (size_t)width + (size_t)xi;
+					if (idx < diff_mask_len)
+						diff_mask[idx] = true;
+				}
+			}
+			diff_mask_any = true;
+		}
 	}
 
 	return changed;
@@ -941,8 +976,8 @@ static bool my_clrtoeol(int y, int x)
 	}
 
 	// make sure color is preserved
-	wmove(mainwin, y, x);
-	wclrtoeol(mainwin);  // faster, presumably
+	wmove(outwin, y, x);
+	wclrtoeol(outwin);  // faster, presumably
 	return false;
 }
 
@@ -960,12 +995,38 @@ static bool my_clrtobot(int y, int x)
 	}
 	// make sure color is preserved
         if (!(flags & WATCH_FOLLOW)) {
-            wmove(mainwin, y, x);
-            wclrtobot(mainwin);  // faster, presumably
+			wmove(outwin, y, x);
+			wclrtobot(outwin);  // faster, presumably
         }
 	return false;
 }
 
+static void apply_highlight_mask(WINDOW *win, const bool *mask)
+{
+	if (!(flags & WATCH_DIFF))
+		return;
+	for (int y = 0; y < MAIN_HEIGHT; y++) {
+		for (int x = 0; x < width; x++) {
+			if (!mask[y * width + x])
+				continue;
+#ifdef WITH_WATCH8BIT
+			cchar_t cc;
+			if (mvwin_wch(win, y, x, &cc) == ERR)
+				continue;
+			short pair = PAIR_NUMBER(cc.attr);
+			attr_t attrs = (cc.attr & A_ATTRIBUTES) | A_STANDOUT;
+			mvwchgat(win, y, x, 1, attrs, pair, NULL);
+#else
+			chtype ch = mvwinch(win, y, x);
+			short pair = PAIR_NUMBER(ch);
+			attr_t attrs = (ch & A_ATTRIBUTES) | A_STANDOUT;
+			mvwchgat(win, y, x, 1, attrs, pair, NULL);
+#endif
+		}
+	}
+}
+
+static uint8_t run_command(void);
 
 
 // Sets screen_changed: when first_screen, screen_changed=false. Otherwise, when
@@ -980,6 +1041,7 @@ static uint8_t run_command(void)
 	int outfd = -1;
 	struct winsize ws;
 	struct winsize *wsp = NULL;
+	diff_mask_any = false;
 
 	if (flags & WATCH_PTY) {
 		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
@@ -1091,7 +1153,7 @@ static uint8_t run_command(void)
 			}
 			if (c == XL('\n')) {
                                 if (flags & WATCH_FOLLOW)
-                                    waddch(mainwin, c);
+									waddch(outwin, c);
                                 else
 				    screen_changed = my_clrtoeol(y, x) || screen_changed;
 				break;
@@ -1230,6 +1292,8 @@ int main(int argc, char *argv[])
 	if (interval_string != NULL)
 		interval_real = strtod_nol_or_err(interval_string, _("Could not parse interval from WATCH_INTERVAL"));
 
+	int diff_count = 0;
+
 	while ((i = getopt_long(argc,argv,"+bCcefd::ghq:n:prs:twvx",longopts,NULL)) != EOF) {
 		switch (i) {
 		case 'b':
@@ -1243,8 +1307,13 @@ int main(int argc, char *argv[])
 			break;
 		case 'd':
 			flags |= WATCH_DIFF;
-			if (optarg)
-				flags |= WATCH_CUMUL;
+			if (optarg && strcmp(optarg, "d") == 0) {
+				diff_count += 2;
+			} else {
+				diff_count++;
+				if (optarg)
+					flags |= WATCH_CUMUL;
+			}
 			break;
 		case 'e':
 			flags |= WATCH_ERREXIT;
@@ -1300,6 +1369,9 @@ int main(int argc, char *argv[])
 	if (optind >= argc)
 		usage(stderr);
 
+	if (diff_count >= 2)
+		flags |= WATCH_PREVIEW;
+
         if ((flags & WATCH_FOLLOW) && (flags & WATCH_ALL_DIFF)) {
             fprintf(stderr, _("Follow -f option conflicts with change options -d,-e or -q"));
             usage(stderr);
@@ -1340,15 +1412,17 @@ int main(int argc, char *argv[])
 	signal(SIGWINCH, winch_handler);
 	/* Set up tty for curses use.  */
 	initscr();  // succeeds or exit()s, may install sig handlers
-        getmaxyx(stdscr, height, width);
-        if (flags & WATCH_NOTITLE) {
-            mainwin = newwin(height, width, 0,0);
-        } else {
-            mainwin = newwin(height-HEADER_HEIGHT, width, HEADER_HEIGHT,0);
-            hdrwin = newwin(HEADER_HEIGHT, width, 0, 0);
-        }
-        if (flags & WATCH_FOLLOW)
-            scrollok(mainwin, TRUE);
+	getmaxyx(stdscr, height, width);
+	if (flags & WATCH_NOTITLE) {
+		win_cur = newwin(height, width, 0,0);
+	} else {
+		win_cur = newwin(height-HEADER_HEIGHT, width, HEADER_HEIGHT,0);
+		hdrwin = newwin(HEADER_HEIGHT, width, 0, 0);
+	}
+	outwin = win_cur;
+	compare_win = win_cur;
+	if (flags & WATCH_FOLLOW)
+		scrollok(win_cur, TRUE);
 	if (flags & WATCH_COLOR) {
 		if (has_colors()) {
 			start_color();
@@ -1367,27 +1441,79 @@ int main(int argc, char *argv[])
 		set_ansi_attribute(-1, NULL);
 		if (screen_size_changed) {
 			screen_size_changed = false;  // "atomic" test-and-set
-                        endwin();
-                        refresh();
-                        getmaxyx(stdscr, height, width);
-                        resizeterm(height, width);
-                        wresize(mainwin, MAIN_HEIGHT, width);
+			endwin();
+			refresh();
+			getmaxyx(stdscr, height, width);
+			resizeterm(height, width);
+			wresize(win_cur, MAIN_HEIGHT, width);
+			outwin = win_cur;
+			compare_win = win_cur;
 			first_screen = true;
+			preview_state.pending = false;
 		}
 
-		output_lowheader_pre(hdrwin);
-		output_header(hdrwin);
-		t = get_time_usec();
-		if (flags & WATCH_PRECISE)
-			last_tick = t;
-		cmdexit = run_command();
-		if (flags & WATCH_PRECISE)
-			output_lowheader(hdrwin, get_time_usec() - t, cmdexit);
-		else {
-			last_tick = get_time_usec();
-			output_lowheader(hdrwin, last_tick - t, cmdexit);
+		if ((flags & WATCH_PREVIEW) && !first_screen) {
+			size_t need = (size_t)MAIN_HEIGHT * (size_t)width;
+			if (!preview_state.nextwin || !preview_state.mask || preview_state.mask_len != need) {
+				if (preview_state.nextwin)
+					delwin(preview_state.nextwin);
+				free(preview_state.mask);
+				preview_state.nextwin = newwin(MAIN_HEIGHT, width, 0, 0);
+				preview_state.mask = xcalloc(need, sizeof(*preview_state.mask));
+				preview_state.mask_len = need;
+			}
+			memset(preview_state.mask, 0, preview_state.mask_len * sizeof(*preview_state.mask));
+			diff_mask = preview_state.mask;
+			diff_mask_len = preview_state.mask_len;
+			diff_mask_any = false;
+
+			outwin = preview_state.nextwin;
+			compare_win = win_cur;
+
+			werase(preview_state.nextwin);
+			output_lowheader_pre(hdrwin);
+			output_header(hdrwin);
+			t = get_time_usec();
+			if (flags & WATCH_PRECISE)
+				last_tick = t;
+			cmdexit = run_command();
+			if (flags & WATCH_PRECISE)
+				preview_state.span = get_time_usec() - t;
+			else {
+				last_tick = get_time_usec();
+				preview_state.span = last_tick - t;
+			}
+			preview_state.exitcode = cmdexit;
+			screen_changed = diff_mask_any;
+
+			// show preview highlights on current screen
+			apply_highlight_mask(win_cur, preview_state.mask);
+			output_lowheader(hdrwin, preview_state.span, preview_state.exitcode);
+			wrefresh(hdrwin);
+			wrefresh(win_cur);
+
+			preview_state.pending = true;
+			preview_state.switch_time = last_tick + interval / 2;
+
+			outwin = win_cur;
+			compare_win = win_cur;
+			diff_mask = NULL;
+			diff_mask_len = 0;
+		} else {
+			output_lowheader_pre(hdrwin);
+			output_header(hdrwin);
+			t = get_time_usec();
+			if (flags & WATCH_PRECISE)
+				last_tick = t;
+			cmdexit = run_command();
+			if (flags & WATCH_PRECISE)
+				output_lowheader(hdrwin, get_time_usec() - t, cmdexit);
+			else {
+				last_tick = get_time_usec();
+				output_lowheader(hdrwin, last_tick - t, cmdexit);
+			}
+			wrefresh(hdrwin);
 		}
-		wrefresh(hdrwin);
 
 		if (cmdexit) {
 			if (flags & WATCH_BEEP)
@@ -1395,7 +1521,7 @@ int main(int argc, char *argv[])
 			if (flags & WATCH_ERREXIT) {
 				// TODO: Hard to see when there's cmd output around it. Add
 				// spaces or move to lowheader.
-				mvwaddstr(mainwin, MAIN_HEIGHT-1, 0, _("command exit with a non-zero status, press a key to exit"));
+				mvwaddstr(win_cur, MAIN_HEIGHT-1, 0, _("command exit with a non-zero status, press a key to exit"));
 				i = fcntl(STDIN_FILENO, F_GETFL);
 				if (i >= 0 && fcntl(STDIN_FILENO, F_SETFL, i|O_NONBLOCK) >= 0) {
 					while (getchar() != EOF) ;
@@ -1424,19 +1550,30 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		wrefresh(mainwin);  // takes some time
+		wrefresh(win_cur);  // takes some time
 		first_screen = false;
 
 		// first process all available input, then respond to
 		// screen_size_changed, then sleep
 		sleep_dontsleep = sleep_scrdumped = sleep_exit = false;
-		do {
+		while (true) {
 			assert(FD_SETSIZE > STDIN_FILENO);
 			FD_SET(STDIN_FILENO, &select_stdin);
 			sleep_dontsleep |= screen_size_changed && ! (flags & WATCH_NORERUN);
 			if (! sleep_dontsleep && (t=get_time_usec()-last_tick) < interval) {
-				tosleep.tv_sec = (interval-t) / USECS_PER_SEC;
-				tosleep.tv_usec = (interval-t) % USECS_PER_SEC;
+				watch_usec_t remaining = interval - t;
+				if (preview_state.pending) {
+					watch_usec_t now = get_time_usec();
+					if (now >= preview_state.switch_time) {
+						remaining = 0;
+					} else {
+						watch_usec_t until_switch = preview_state.switch_time - now;
+						if (until_switch < remaining)
+							remaining = until_switch;
+					}
+				}
+				tosleep.tv_sec = remaining / USECS_PER_SEC;
+				tosleep.tv_usec = remaining % USECS_PER_SEC;
 			}
 			else memset(&tosleep, 0, sizeof(tosleep));
 			i = select(STDIN_FILENO+1, &select_stdin, NULL, NULL, &tosleep);
@@ -1462,7 +1599,22 @@ int main(int argc, char *argv[])
 					break;
 				}
 			}
-		} while (i);
+			if (preview_state.pending && get_time_usec() >= preview_state.switch_time) {
+			overwrite(preview_state.nextwin, win_cur);
+				apply_highlight_mask(win_cur, preview_state.mask);
+				wrefresh(win_cur);
+				preview_state.pending = false;
+			}
+
+			if (sleep_exit)
+				break;
+			if (i > 0)
+				continue;
+			if (preview_state.pending)
+				continue;
+			if ((get_time_usec() - last_tick) >= interval)
+				break;
+		}
 		if (sleep_exit)
 			break;
 	}
