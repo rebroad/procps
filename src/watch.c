@@ -133,8 +133,10 @@ static char **ansi_pending_lines;
 static char **ansi_pending_plain;
 static int16_t **ansi_pending_ages;
 static size_t *ansi_pending_age_len;
+static bool **ansi_pending_mask;
+static size_t *ansi_pending_mask_len;
 static bool ansi_pending_active;
-static int ansi_pending_frames;
+static int ansi_pending_step;
 static int ansi_fade_cycles = 8;
 static int ansi_fade_fps = 12;
 static double ansi_fade_seconds = 1.0;
@@ -170,7 +172,9 @@ static void query_default_bg(void);
 static bool parse_rgb_response(const char *rgb, int *r, int *g, int *b);
 static void log_watch_debug(const char *label, int r, int g, int b, bool ok);
 static void log_watch_settings(void);
-static int16_t *build_fadein_ages(const char *prev, const char *next, size_t prev_glyphs);
+static bool *build_fadein_mask(const char *prev, const char *next, size_t prev_glyphs);
+static double ansi_intensity_ratio(int16_t age);
+static void ansi_apply_fadein_step(int step);
 typedef struct {
 	int start_col;
 	int width;
@@ -1041,11 +1045,11 @@ static void log_watch_settings(void)
 	fclose(fp);
 }
 
-static int16_t *build_fadein_ages(const char *prev, const char *next, size_t prev_glyphs)
+static bool *build_fadein_mask(const char *prev, const char *next, size_t prev_glyphs)
 {
-	int16_t *ages = xcalloc(prev_glyphs, sizeof(*ages));
+	bool *mask = xcalloc(prev_glyphs, sizeof(*mask));
 	if (width <= 0 || prev_glyphs == 0) {
-		return ages;
+		return mask;
 	}
 	uint32_t *prev_sig = NULL;
 	uint32_t *next_sig = NULL;
@@ -1069,10 +1073,7 @@ static int16_t *build_fadein_ages(const char *prev, const char *next, size_t pre
 				break;
 			}
 		}
-		if (ch)
-			ages[g] = (ansi_fade_in_frames > 0) ? (int16_t)-ansi_fade_in_frames : 0;
-		else
-			ages[g] = (int16_t)ansi_fade_cycles;
+		mask[g] = ch;
 	}
 
 	free(prev_sig);
@@ -1081,7 +1082,53 @@ static int16_t *build_fadein_ages(const char *prev, const char *next, size_t pre
 	free(next_cols);
 	free(prev_spans);
 	free(next_spans);
-	return ages;
+	return mask;
+}
+
+static double ansi_intensity_ratio(int16_t age)
+{
+	if (age >= ansi_fade_cycles)
+		return 0.0;
+	if (age < 0 && ansi_fade_in_frames > 0) {
+		double ratio = (double)(ansi_fade_in_frames + age) / (double)ansi_fade_in_frames;
+		if (ratio < 0.0)
+			ratio = 0.0;
+		if (ratio > 1.0)
+			ratio = 1.0;
+		return ratio;
+	}
+	if (ansi_fade_half_life && ansi_fade_half_life_frames > 0) {
+		return pow(0.5, (double)age / (double)ansi_fade_half_life_frames);
+	}
+	if (ansi_fade_cycles <= 0)
+		return 0.0;
+	return (double)(ansi_fade_cycles - age) / (double)ansi_fade_cycles;
+}
+
+static void ansi_apply_fadein_step(int step)
+{
+	if (ansi_fade_in_frames <= 0)
+		return;
+	if (step < 0)
+		step = 0;
+	if (step > ansi_fade_in_frames)
+		step = ansi_fade_in_frames;
+	int16_t desired_age = (int16_t)(-ansi_fade_in_frames + step);
+	double desired_ratio = ansi_intensity_ratio(desired_age);
+	for (int row = 0; row < ansi_prev_count; row++) {
+		if (!ansi_char_age[row] || !ansi_pending_mask || !ansi_pending_mask[row])
+			continue;
+		size_t len = ansi_char_age_len[row];
+		size_t mlen = ansi_pending_mask_len[row];
+		size_t count = len < mlen ? len : mlen;
+		for (size_t i = 0; i < count; i++) {
+			if (!ansi_pending_mask[row][i])
+				continue;
+			double current_ratio = ansi_intensity_ratio(ansi_char_age[row][i]);
+			if (current_ratio < desired_ratio)
+				ansi_char_age[row][i] = desired_age;
+		}
+	}
 }
 
 static uint32_t hash_bytes(const char *s, size_t len)
@@ -1367,6 +1414,7 @@ static void ansi_reset_prev_buffers(int count)
 		free(ansi_pending_lines ? ansi_pending_lines[i] : NULL);
 		free(ansi_pending_plain ? ansi_pending_plain[i] : NULL);
 		free(ansi_pending_ages ? ansi_pending_ages[i] : NULL);
+		free(ansi_pending_mask ? ansi_pending_mask[i] : NULL);
 	}
 	free(ansi_prev_lines);
 	free(ansi_prev_plain);
@@ -1378,8 +1426,10 @@ static void ansi_reset_prev_buffers(int count)
 	free(ansi_pending_plain);
 	free(ansi_pending_ages);
 	free(ansi_pending_age_len);
+	free(ansi_pending_mask);
+	free(ansi_pending_mask_len);
 	ansi_pending_active = false;
-	ansi_pending_frames = 0;
+	ansi_pending_step = 0;
 	ansi_prev_lines = xcalloc((size_t)count, sizeof(*ansi_prev_lines));
 	ansi_prev_plain = xcalloc((size_t)count, sizeof(*ansi_prev_plain));
 	ansi_line_age = xcalloc((size_t)count, sizeof(*ansi_line_age));
@@ -1390,6 +1440,8 @@ static void ansi_reset_prev_buffers(int count)
 	ansi_pending_plain = xcalloc((size_t)count, sizeof(*ansi_pending_plain));
 	ansi_pending_ages = xcalloc((size_t)count, sizeof(*ansi_pending_ages));
 	ansi_pending_age_len = xcalloc((size_t)count, sizeof(*ansi_pending_age_len));
+	ansi_pending_mask = xcalloc((size_t)count, sizeof(*ansi_pending_mask));
+	ansi_pending_mask_len = xcalloc((size_t)count, sizeof(*ansi_pending_mask_len));
 	ansi_prev_count = count;
 }
 
@@ -2869,26 +2921,27 @@ int main(int argc, char *argv[])
 
 				if (ansi_fade_in_frames > 0 && any_changed && !first_screen) {
 					ansi_pending_active = true;
-					ansi_pending_frames = ansi_fade_in_frames;
+					ansi_pending_step = 0;
 					for (int row = 0; row < MAIN_HEIGHT; row++) {
 						free(ansi_pending_lines[row]);
 						free(ansi_pending_plain[row]);
 						free(ansi_pending_ages[row]);
+						free(ansi_pending_mask[row]);
 						ansi_pending_lines[row] = (row < line_count && lines[row]) ? lines[row] : xstrdup("");
 						ansi_pending_plain[row] = temp_plain[row];
 						ansi_pending_ages[row] = temp_new_ages[row];
 						ansi_pending_age_len[row] = temp_glyph[row];
-						if (row < line_count)
-							lines[row] = NULL;
 						size_t prev_glyphs = utf8_count_glyphs(ansi_prev_plain[row] ? ansi_prev_plain[row] : "");
-						int16_t *fadein = build_fadein_ages(
+						ansi_pending_mask[row] = build_fadein_mask(
 							ansi_prev_plain[row] ? ansi_prev_plain[row] : "",
 							ansi_pending_plain[row] ? ansi_pending_plain[row] : "",
 							prev_glyphs);
-						free(ansi_char_age[row]);
-						ansi_char_age[row] = fadein;
+						ansi_pending_mask_len[row] = prev_glyphs;
+						if (row < line_count)
+							lines[row] = NULL;
 						ansi_char_age_len[row] = prev_glyphs;
 					}
+					ansi_apply_fadein_step(0);
 					ansi_render_current(start_row);
 				} else {
 					for (int row = 0; row < MAIN_HEIGHT; row++) {
@@ -3070,9 +3123,16 @@ int main(int argc, char *argv[])
 							}
 							next_render += frame;
 						} while (now >= next_render);
-						if (ansi_pending_active) {
-							ansi_pending_frames--;
-							if (ansi_pending_frames <= 0) {
+						if (ansi_pending_active && ansi_fade_in_frames > 0) {
+							int step = ansi_pending_step;
+							if (step < 0)
+								step = 0;
+							if (step > ansi_fade_in_frames)
+								step = ansi_fade_in_frames;
+							ansi_apply_fadein_step(step);
+							if (ansi_pending_step < ansi_fade_in_frames)
+								ansi_pending_step++;
+							if (ansi_pending_step >= ansi_fade_in_frames) {
 								for (int row = 0; row < ansi_prev_count; row++) {
 									int16_t *col_ages = build_column_ages(
 										ansi_prev_plain[row] ? ansi_prev_plain[row] : "",
@@ -3093,6 +3153,9 @@ int main(int argc, char *argv[])
 									ansi_pending_plain[row] = NULL;
 									ansi_pending_ages[row] = NULL;
 									ansi_pending_age_len[row] = 0;
+									free(ansi_pending_mask[row]);
+									ansi_pending_mask[row] = NULL;
+									ansi_pending_mask_len[row] = 0;
 									free(col_ages);
 								}
 								ansi_pending_active = false;
