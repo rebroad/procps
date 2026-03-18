@@ -51,6 +51,7 @@
 #include <math.h>
 #include <strings.h>
 #include <pwd.h>
+#include <wctype.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -170,6 +171,15 @@ static bool parse_rgb_response(const char *rgb, int *r, int *g, int *b);
 static void log_watch_debug(const char *label, int r, int g, int b, bool ok);
 static void log_watch_settings(void);
 static int16_t *build_fadein_ages(const char *prev, const char *next, size_t prev_glyphs);
+typedef struct {
+	int start_col;
+	int width;
+} GlyphSpan;
+static uint32_t hash_bytes(const char *s, size_t len);
+static void build_line_map(const char *plain, int width,
+	uint32_t **out_sig, int **out_col_glyph, GlyphSpan **out_spans, size_t *out_glyphs);
+static int16_t *build_column_ages(const char *plain, const int16_t *ages, size_t age_len, int width);
+static int16_t *build_new_ages_from_columns(const char *plain, const int16_t *col_ages, int width);
 
 typedef uf64 watch_usec_t;
 #define USECS_PER_SEC ((watch_usec_t)1000000)  // same type
@@ -1034,36 +1044,225 @@ static void log_watch_settings(void)
 static int16_t *build_fadein_ages(const char *prev, const char *next, size_t prev_glyphs)
 {
 	int16_t *ages = xcalloc(prev_glyphs, sizeof(*ages));
-	size_t plen = prev ? strlen(prev) : 0;
-	size_t nlen = next ? strlen(next) : 0;
-	size_t pi = 0;
-	size_t ni = 0;
-	size_t g = 0;
-	while (pi < plen && g < prev_glyphs) {
-		size_t pseq = utf8_seq_len((unsigned char)prev[pi]);
-		if (pseq > 1 && pi + pseq > plen)
-			pseq = 1;
+	if (width <= 0 || prev_glyphs == 0) {
+		return ages;
+	}
+	uint32_t *prev_sig = NULL;
+	uint32_t *next_sig = NULL;
+	int *prev_cols = NULL;
+	int *next_cols = NULL;
+	GlyphSpan *prev_spans = NULL;
+	GlyphSpan *next_spans = NULL;
+	size_t prev_count = 0;
+	size_t next_count = 0;
+	build_line_map(prev ? prev : "", width, &prev_sig, &prev_cols, &prev_spans, &prev_count);
+	build_line_map(next ? next : "", width, &next_sig, &next_cols, &next_spans, &next_count);
+
+	size_t count = prev_glyphs < prev_count ? prev_glyphs : prev_count;
+	for (size_t g = 0; g < count; g++) {
+		GlyphSpan span = prev_spans[g];
 		bool ch = false;
-		size_t nseq = 0;
-		if (!next || ni >= nlen) {
-			ch = true;
-		} else {
-			nseq = utf8_seq_len((unsigned char)next[ni]);
-			if (nseq > 1 && ni + nseq > nlen)
-				nseq = 1;
-			if (pseq != nseq || memcmp(prev + pi, next + ni, pseq) != 0)
+		for (int c = 0; c < span.width && (span.start_col + c) < width; c++) {
+			int col = span.start_col + c;
+			if (prev_sig[col] != next_sig[col]) {
 				ch = true;
+				break;
+			}
 		}
 		if (ch)
 			ages[g] = (ansi_fade_in_frames > 0) ? (int16_t)-ansi_fade_in_frames : 0;
 		else
 			ages[g] = (int16_t)ansi_fade_cycles;
-		pi += pseq;
-		if (!ch && nseq > 0)
-			ni += nseq;
-		else if (ni < nlen && nseq > 0)
-			ni += nseq;
+	}
+
+	free(prev_sig);
+	free(next_sig);
+	free(prev_cols);
+	free(next_cols);
+	free(prev_spans);
+	free(next_spans);
+	return ages;
+}
+
+static uint32_t hash_bytes(const char *s, size_t len)
+{
+	uint32_t h = 2166136261u;
+	for (size_t i = 0; i < len; i++) {
+		h ^= (uint8_t)s[i];
+		h *= 16777619u;
+	}
+	return h ? h : 1u;
+}
+
+static void build_line_map(const char *plain, int width,
+	uint32_t **out_sig, int **out_col_glyph, GlyphSpan **out_spans, size_t *out_glyphs)
+{
+	size_t len = plain ? strlen(plain) : 0;
+	uint32_t *sig = xcalloc((size_t)width, sizeof(*sig));
+	int *col_glyph = xmalloc((size_t)width * sizeof(*col_glyph));
+	for (int i = 0; i < width; i++)
+		col_glyph[i] = -1;
+	size_t cap = len + 8;
+	GlyphSpan *spans = xcalloc(cap, sizeof(*spans));
+	size_t glyphs = 0;
+	size_t i = 0;
+	int col = 0;
+	mbstate_t st;
+	memset(&st, 0, sizeof(st));
+	while (i < len && col < width) {
+		unsigned char c = (unsigned char)plain[i];
+		if (c == '\t') {
+			int next = ((col / 8) + 1) * 8;
+			while (col < next && col < width) {
+				sig[col] = 0;
+				col_glyph[col] = -1;
+				col++;
+			}
+			i++;
+			continue;
+		}
+		size_t seq = utf8_seq_len(c);
+		if (seq > 1 && i + seq > len)
+			seq = 1;
+		wchar_t wc;
+		size_t m = mbrtowc(&wc, plain + i, seq, &st);
+		int w = 1;
+		if (m == (size_t)-1 || m == (size_t)-2) {
+			memset(&st, 0, sizeof(st));
+			seq = 1;
+			w = 1;
+		} else {
+			int wcw = wcwidth(wc);
+			w = wcw < 1 ? 1 : wcw;
+		}
+		if (col + w > width)
+			w = width - col;
+		bool is_space = (m != (size_t)-1 && m != (size_t)-2) ? iswspace(wc) : (c == ' ');
+		uint32_t h = is_space ? 0u : hash_bytes(plain + i, seq);
+		if (glyphs >= cap) {
+			cap *= 2;
+			spans = xrealloc(spans, cap * sizeof(*spans));
+		}
+		spans[glyphs].start_col = col;
+		spans[glyphs].width = w;
+		for (int j = 0; j < w && col < width; j++, col++) {
+			sig[col] = h;
+			col_glyph[col] = (int)glyphs;
+		}
+		glyphs++;
+		i += seq;
+	}
+	*out_sig = sig;
+	*out_col_glyph = col_glyph;
+	*out_spans = spans;
+	*out_glyphs = glyphs;
+}
+
+static int16_t *build_column_ages(const char *plain, const int16_t *ages, size_t age_len, int width)
+{
+	if (width <= 0)
+		return NULL;
+	int16_t *col_ages = xcalloc((size_t)width, sizeof(*col_ages));
+	for (int i = 0; i < width; i++)
+		col_ages[i] = (int16_t)ansi_fade_cycles;
+	if (!plain || !*plain || !ages || age_len == 0)
+		return col_ages;
+
+	size_t len = strlen(plain);
+	size_t i = 0;
+	size_t g = 0;
+	int col = 0;
+	mbstate_t st;
+	memset(&st, 0, sizeof(st));
+	while (i < len && col < width && g < age_len) {
+		unsigned char c = (unsigned char)plain[i];
+		if (c == '\t') {
+			int next = ((col / 8) + 1) * 8;
+			while (col < next && col < width) {
+				col_ages[col] = ages[g];
+				col++;
+			}
+			i++;
+			g++;
+			continue;
+		}
+		size_t seq = utf8_seq_len(c);
+		if (seq > 1 && i + seq > len)
+			seq = 1;
+		wchar_t wc;
+		size_t m = mbrtowc(&wc, plain + i, seq, &st);
+		int w = 1;
+		if (m == (size_t)-1 || m == (size_t)-2) {
+			memset(&st, 0, sizeof(st));
+			seq = 1;
+			w = 1;
+		} else {
+			int wcw = wcwidth(wc);
+			w = wcw < 1 ? 1 : wcw;
+		}
+		if (col + w > width)
+			w = width - col;
+		for (int j = 0; j < w && col < width; j++, col++)
+			col_ages[col] = ages[g];
+		i += seq;
 		g++;
+	}
+	return col_ages;
+}
+
+static int16_t *build_new_ages_from_columns(const char *plain, const int16_t *col_ages, int width)
+{
+	if (!plain || width <= 0)
+		return xcalloc(1, sizeof(int16_t));
+	size_t len = strlen(plain);
+	size_t cap = len + 8;
+	int16_t *ages = xcalloc(cap, sizeof(*ages));
+	size_t g = 0;
+	size_t i = 0;
+	int col = 0;
+	mbstate_t st;
+	memset(&st, 0, sizeof(st));
+	while (i < len && col < width) {
+		if (g >= cap) {
+			cap *= 2;
+			ages = xrealloc(ages, cap * sizeof(*ages));
+		}
+		unsigned char c = (unsigned char)plain[i];
+		if (c == '\t') {
+			int next = ((col / 8) + 1) * 8;
+			int16_t min_age = (int16_t)ansi_fade_cycles;
+			while (col < next && col < width) {
+				if (col_ages && col_ages[col] < min_age)
+					min_age = col_ages[col];
+				col++;
+			}
+			ages[g++] = min_age;
+			i++;
+			continue;
+		}
+		size_t seq = utf8_seq_len(c);
+		if (seq > 1 && i + seq > len)
+			seq = 1;
+		wchar_t wc;
+		size_t m = mbrtowc(&wc, plain + i, seq, &st);
+		int w = 1;
+		if (m == (size_t)-1 || m == (size_t)-2) {
+			memset(&st, 0, sizeof(st));
+			seq = 1;
+			w = 1;
+		} else {
+			int wcw = wcwidth(wc);
+			w = wcw < 1 ? 1 : wcw;
+		}
+		if (col + w > width)
+			w = width - col;
+		int16_t min_age = (int16_t)ansi_fade_cycles;
+		for (int j = 0; j < w && col < width; j++, col++) {
+			if (col_ages && col_ages[col] < min_age)
+				min_age = col_ages[col];
+		}
+		ages[g++] = min_age;
+		i += seq;
 	}
 	return ages;
 }
@@ -2605,9 +2804,17 @@ int main(int argc, char *argv[])
 					if ((flags & WATCH_ALL_DIFF) && have_prev && changed)
 						screen_changed = true;
 
-					size_t plen = strlen(plain);
-					size_t prev_len = ansi_prev_plain[row] ? strlen(ansi_prev_plain[row]) : 0;
-					size_t glyph_count = utf8_count_glyphs(plain);
+					uint32_t *prev_sig = NULL;
+					uint32_t *new_sig = NULL;
+					int *prev_cols = NULL;
+					int *new_cols = NULL;
+					GlyphSpan *prev_spans = NULL;
+					GlyphSpan *new_spans = NULL;
+					size_t prev_glyphs = 0;
+					size_t glyph_count = 0;
+					build_line_map(ansi_prev_plain[row] ? ansi_prev_plain[row] : "", width,
+						&prev_sig, &prev_cols, &prev_spans, &prev_glyphs);
+					build_line_map(plain, width, &new_sig, &new_cols, &new_spans, &glyph_count);
 					temp_glyph[row] = glyph_count;
 					temp_plain[row] = plain;
 					int16_t *new_ages = xcalloc(glyph_count, sizeof(*new_ages));
@@ -2616,28 +2823,22 @@ int main(int argc, char *argv[])
 							for (size_t i = 0; i < glyph_count; i++)
 								new_ages[i] = (int16_t)ansi_fade_cycles;
 						} else {
-							size_t i = 0;
-							size_t pi = 0;
 							size_t g = 0;
-							while (i < plen && g < glyph_count) {
-								size_t seq = utf8_seq_len((unsigned char)plain[i]);
-								if (seq > 1 && i + seq > plen)
-									seq = 1;
+							while (g < glyph_count) {
+								GlyphSpan span = new_spans[g];
 								bool ch = false;
-								size_t pseq = 0;
-								if (!ansi_prev_plain[row] || pi >= prev_len) {
-									ch = true;
-								} else {
-									pseq = utf8_seq_len((unsigned char)ansi_prev_plain[row][pi]);
-									if (pseq > 1 && pi + pseq > prev_len)
-										pseq = 1;
-									if (seq != pseq || memcmp(plain + i, ansi_prev_plain[row] + pi, seq) != 0)
+								for (int c = 0; c < span.width && (span.start_col + c) < width; c++) {
+									int col = span.start_col + c;
+									if (new_sig[col] != prev_sig[col]) {
 										ch = true;
+										break;
+									}
 								}
+								int prev_g = (span.start_col < width) ? prev_cols[span.start_col] : -1;
 								if (ch) {
 									new_ages[g] = 0;
-								} else if (ansi_char_age[row] && g < ansi_char_age_len[row]) {
-									int16_t prev_age = ansi_char_age[row][g];
+								} else if (ansi_char_age[row] && prev_g >= 0 && (size_t)prev_g < ansi_char_age_len[row]) {
+									int16_t prev_age = ansi_char_age[row][prev_g];
 									if (flags & WATCH_CUMUL) {
 										new_ages[g] = prev_age <= 0 ? (int16_t)prev_age : (int16_t)ansi_fade_cycles;
 									} else {
@@ -2649,11 +2850,6 @@ int main(int argc, char *argv[])
 								} else {
 									new_ages[g] = (int16_t)ansi_fade_cycles;
 								}
-								i += seq;
-								if (!ch && pseq > 0)
-									pi += pseq;
-								else if (pi < prev_len && pseq > 0)
-									pi += pseq;
 								g++;
 							}
 						}
@@ -2662,6 +2858,13 @@ int main(int argc, char *argv[])
 							new_ages[i] = (int16_t)ansi_fade_cycles;
 					}
 					temp_new_ages[row] = new_ages;
+
+					free(prev_sig);
+					free(new_sig);
+					free(prev_cols);
+					free(new_cols);
+					free(prev_spans);
+					free(new_spans);
 				}
 
 				if (ansi_fade_in_frames > 0 && any_changed && !first_screen) {
@@ -2871,17 +3074,26 @@ int main(int argc, char *argv[])
 							ansi_pending_frames--;
 							if (ansi_pending_frames <= 0) {
 								for (int row = 0; row < ansi_prev_count; row++) {
+									int16_t *col_ages = build_column_ages(
+										ansi_prev_plain[row] ? ansi_prev_plain[row] : "",
+										ansi_char_age[row],
+										ansi_char_age_len[row],
+										width);
 									free(ansi_prev_lines[row]);
 									free(ansi_prev_plain[row]);
 									free(ansi_char_age[row]);
 									ansi_prev_lines[row] = ansi_pending_lines[row];
 									ansi_prev_plain[row] = ansi_pending_plain[row];
-									ansi_char_age[row] = ansi_pending_ages[row];
-									ansi_char_age_len[row] = ansi_pending_age_len[row];
+									ansi_char_age[row] = build_new_ages_from_columns(
+										ansi_prev_plain[row] ? ansi_prev_plain[row] : "",
+										col_ages,
+										width);
+									ansi_char_age_len[row] = utf8_count_glyphs(ansi_prev_plain[row] ? ansi_prev_plain[row] : "");
 									ansi_pending_lines[row] = NULL;
 									ansi_pending_plain[row] = NULL;
 									ansi_pending_ages[row] = NULL;
 									ansi_pending_age_len[row] = 0;
+									free(col_ages);
 								}
 								ansi_pending_active = false;
 							}
