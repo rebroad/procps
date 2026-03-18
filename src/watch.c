@@ -99,6 +99,7 @@
 #define WATCH_NOTITLE  (1 << 11)
 #define WATCH_FOLLOW   (1 << 12)
 #define WATCH_PTY      (1 << 13)
+#define WATCH_PREVIEW  (1 << 14)
 // Do we care about screen contents changes at all?
 #define WATCH_ALL_DIFF (WATCH_DIFF | WATCH_CHGEXIT | WATCH_EQUEXIT)
 
@@ -127,7 +128,7 @@ static void __attribute__ ((__noreturn__)) usage(FILE * out)
 	fputs(_("  -c, --color            interpret ANSI color and style sequences\n"), out);
 	fputs(_("  -C, --no-color         do not interpret ANSI color and style sequences\n"), out);
 	fputs(_("  -d, --differences[=<permanent>]\n"
-	        "                         highlight changes between updates\n"), out);
+			"                         highlight changes between updates (-dd highlights before change)\n"), out);
 	fputs(_("  -e, --errexit          exit if command has a non-zero exit\n"), out);
         fputs(_("  -f, --follow           Follow the output and don't clear screen\n"), out);
 	fputs(_("  -g, --chgexit          exit when output from command changes\n"), out);
@@ -561,7 +562,7 @@ static void screenshot(void) {
 	char *const buf = xmalloc(bufsize);
 
 	int yin, xout, tmpy, tmpx;
-        getyx(mainwin, tmpy, tmpx);
+	getyx(mainwin, tmpy, tmpx);
 	for (int y=0; y<tmpy; ++y) {
 		yin = mvwinnstr(mainwin, y, 0, buf, bufsize-1);
 		if (yin == ERR)  // screen resized
@@ -573,7 +574,7 @@ static void screenshot(void) {
 				endwin_xerr(1, "write(%s)", dumpfile);
 		}
 	}
-        wmove(mainwin, tmpy, tmpx);
+	wmove(mainwin, tmpy, tmpx);
 	free(buf);
 
 	if (close(f) == -1)
@@ -968,16 +969,17 @@ static bool my_clrtobot(int y, int x)
 
 
 
-// Sets screen_changed: when first_screen, screen_changed=false. Otherwise, when
-// ! WATCH_ALL_DIFF, screen_changed will be unspecified. Otherwise,
-// screen_changed=true <==> the screen changed.
-//
-// Make sure not to leak system resources (incl. fds, processes). Suggesting
-// -D_XOPEN_SOURCE=600 and an EINTR loop around every fclose() as well.
-static uint8_t run_command(void)
+struct watch_output {
+	char *buf;
+	size_t len;
+};
+
+// This helper centralizes command spawning and output redirection so that both
+// direct rendering and delayed two-phase rendering use the same fork/exec path.
+static pid_t spawn_command(int *outfd)
 {
-	int pipefd[2] = {-1, -1}, status;  // [0] = output, [1] = input
-	int outfd = -1;
+	int pipefd[2] = {-1, -1};  // [0] = output, [1] = input
+	int status;
 	struct winsize ws;
 	struct winsize *wsp = NULL;
 
@@ -994,7 +996,7 @@ static uint8_t run_command(void)
 
 	pid_t child;
 	if (flags & WATCH_PTY) {
-		child = forkpty(&outfd, NULL, NULL, wsp);
+		child = forkpty(outfd, NULL, NULL, wsp);
 		if (child < 0)
 			endwin_xerr(2, _("unable to fork process"));
 	} else {
@@ -1050,19 +1052,36 @@ static uint8_t run_command(void)
 	if (!(flags & WATCH_PTY))
 		while (close(pipefd[1]) == -1 && errno == EINTR) ;
 	if (flags & WATCH_PTY) {
-		if (outfd < 0)
+		if (*outfd < 0)
 			endwin_xerr(2, _("unable to create PTY"));
 	} else {
-		outfd = pipefd[0];
+		*outfd = pipefd[0];
 	}
-	FILE *p = fdopen(outfd, "r");
-	if (! p)
-		endwin_xerr(2, _("fdopen"));
-	setvbuf(p, NULL, _IOFBF, BUFSIZ);  // We'll getc() from it. A lot.
+	return child;
+}
 
+static uint8_t wait_command(pid_t child)
+{
+	int status;
+
+	/* harvest child process and get status, propagated from command */
+	while (waitpid(child, &status, 0) == -1) {
+		if (errno != EINTR)
+			return 0x7f;
+	}
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	assert(WIFSIGNALED(status));
+	return 0x80 + (WTERMSIG(status) & 0x7f);
+}
+
+// This helper exists so we can render either live command output or buffered
+// output bytes with the exact same text parsing and highlight algorithm.
+static bool render_stream(FILE *p)
+{
 	Xint c, carry = XEOF;
 	int cwid, y, x;  // cwid = character width in terminal columns
-	screen_changed = false;
+	bool changed = false;
 
 	for (y = 0; y < MAIN_HEIGHT || (flags & WATCH_FOLLOW); ++y) {
 		x = 0;
@@ -1084,7 +1103,7 @@ static uint8_t run_command(void)
 
 			if (c == XEOF) {
                                 if (!(flags & WATCH_FOLLOW)) {
-				    screen_changed = my_clrtobot(y, x) || screen_changed;
+					changed = my_clrtobot(y, x) || changed;
 				    y = MAIN_HEIGHT - 1;
                                 }
 				break;
@@ -1093,7 +1112,7 @@ static uint8_t run_command(void)
                                 if (flags & WATCH_FOLLOW)
                                     waddch(mainwin, c);
                                 else
-				    screen_changed = my_clrtoeol(y, x) || screen_changed;
+					changed = my_clrtoeol(y, x) || changed;
 				break;
 			}
 			if (c == XL('\033')) {
@@ -1138,19 +1157,19 @@ static uint8_t run_command(void)
 					reset_ansi();
 					set_ansi_attribute(-1, NULL);
 				}
-				screen_changed = my_clrtoeol(y, x) || screen_changed;
+				changed = my_clrtoeol(y, x) || changed;
 				break;
 			}
 
 			// it fits, print it
 			if (c == XL('\t')) {
-				do screen_changed = display_char(y, x++, XL(' '), 1) || screen_changed;
+				do changed = display_char(y, x++, XL(' '), 1) || changed;
 				while (x % TAB_WIDTH && x < width);
 			}
 			else {
 				// cwid=0 => non-spacing char modifying the preceding spacing
 				// char
-				screen_changed = display_char(y, x-!cwid, c, cwid) || screen_changed;
+				changed = display_char(y, x-!cwid, c, cwid) || changed;
 				x += cwid;
 			}
 		}
@@ -1159,29 +1178,165 @@ static uint8_t run_command(void)
                 }
 	}
 
+	return changed;
+}
+
+// This helper avoids duplicating the temporary "diff off / diff on" rendering
+// passes needed for the -dd preview mode, while preserving the existing parser.
+static bool render_buffer(const struct watch_output *out, bool enable_diff)
+{
+	FILE *fp;
+	uf16 saved_flags;
+	bool changed;
+
+	assert(out != NULL);
+	fp = fmemopen(out->buf, out->len, "r");
+	if (!fp)
+		endwin_xerr(2, _("fdopen"));
+	setvbuf(fp, NULL, _IOFBF, BUFSIZ);
+
+	saved_flags = flags;
+	if (enable_diff)
+		flags |= WATCH_ALL_DIFF;
+	else
+		flags &= ~WATCH_ALL_DIFF;
+	changed = render_stream(fp);
+	flags = saved_flags;
+	fclose(fp);
+	return changed;
+}
+
+// Sets screen_changed: when first_screen, screen_changed=false. Otherwise, when
+// ! WATCH_ALL_DIFF, screen_changed will be unspecified. Otherwise,
+// screen_changed=true <==> the screen changed.
+static uint8_t run_command(void)
+{
+	int outfd = -1;
+	pid_t child = spawn_command(&outfd);
+	FILE *p = fdopen(outfd, "r");
+	if (! p)
+		endwin_xerr(2, _("fdopen"));
+	setvbuf(p, NULL, _IOFBF, BUFSIZ);  // We'll getc() from it. A lot.
+
+	screen_changed = render_stream(p);
+
 	skiptoeof(p);  // avoid SIGPIPE in child
 	fclose(p);
+	return wait_command(child);
+}
 
-	/* harvest child process and get status, propagated from command */
-	// TODO: gettext string no longer used
-	while (waitpid(child, &status, 0) == -1) {
-		if (errno != EINTR)
-			return 0x7f;
+// This helper is needed for -dd mode so we can capture each cycle's output now
+// and delay what gets shown until phase boundaries inside the same interval.
+static uint8_t run_command_capture(struct watch_output *out)
+{
+	int outfd = -1;
+	pid_t child = spawn_command(&outfd);
+	FILE *p = fdopen(outfd, "r");
+	unsigned char chunk[4096];
+
+	if (! p)
+		endwin_xerr(2, _("fdopen"));
+	out->len = 0;
+
+	while (!feof(p) && !ferror(p)) {
+		size_t got = fread(chunk, 1, sizeof(chunk), p);
+		if (!got)
+			continue;
+		out->buf = xrealloc(out->buf, out->len + got + 1);
+		memcpy(out->buf + out->len, chunk, got);
+		out->len += got;
 	}
-	if (WIFEXITED(status))
-		return WEXITSTATUS(status);
-	assert(WIFSIGNALED(status));
-	return 0x80 + (WTERMSIG(status) & 0x7f);
+	if (!out->buf)
+		out->buf = xmalloc(1);
+	out->buf[out->len] = '\0';
+	fclose(p);
+	return wait_command(child);
+}
+
+static void render_prev_diff_transition(const struct watch_output *current,
+										const struct watch_output *next,
+										bool show_current)
+{
+	if (show_current) {
+		(void)!render_buffer(next, false);
+		(void)!render_buffer(current, true);
+		return;
+	}
+	screen_changed = false;
+	(void)!render_buffer(current, false);
+	screen_changed = render_buffer(next, true);
+}
+
+// This helper keeps output buffer ownership logic in one place so the delayed
+// rendering path can promote "next" output to "current" without duplicating
+// pointer shuffling at each transition point.
+static void replace_output(struct watch_output *dst, struct watch_output *src)
+{
+	free(dst->buf);
+	dst->buf = src->buf;
+	dst->len = src->len;
+	src->buf = NULL;
+	src->len = 0;
+}
+
+// This helper is shared by both the half-interval and end-of-interval waits so
+// input handling and rerun behavior stay consistent in normal and -dd modes.
+static bool wait_until(watch_usec_t deadline, bool *sleep_scrdumped, bool *sleep_exit)
+{
+	int i;
+	fd_set select_stdin;
+	struct timeval tosleep;
+	bool sleep_dontsleep = false;
+
+	do {
+		assert(FD_SETSIZE > STDIN_FILENO);
+		FD_ZERO(&select_stdin);
+		FD_SET(STDIN_FILENO, &select_stdin);
+		sleep_dontsleep |= screen_size_changed && ! (flags & WATCH_NORERUN);
+		watch_usec_t now = get_time_usec();
+		if (!sleep_dontsleep && now < deadline) {
+			watch_usec_t remaining = deadline - now;
+			tosleep.tv_sec = remaining / USECS_PER_SEC;
+			tosleep.tv_usec = remaining % USECS_PER_SEC;
+		} else {
+			memset(&tosleep, 0, sizeof(tosleep));
+		}
+		i = select(STDIN_FILENO+1, &select_stdin, NULL, NULL, &tosleep);
+		assert(i != -1 || errno == EINTR);
+		if (i > 0) {
+			switch (getchar()) {
+			case EOF:
+				if (errno != EINTR)
+					endwin_xerr(1, "getchar()");
+				break;
+			case 'q':
+				*sleep_exit = true;
+				sleep_dontsleep = true;
+				break;
+			case ' ':
+				sleep_dontsleep = true;
+				break;
+			case 's':
+				if (!*sleep_scrdumped) {
+					screenshot();
+					*sleep_scrdumped = true;
+				}
+				break;
+			}
+		}
+	} while (i);
+
+	return sleep_dontsleep;
 }
 
 int main(int argc, char *argv[])
 {
 	int i;
-	watch_usec_t interval, last_tick = 0, t;
+	watch_usec_t interval, half_interval, last_tick = 0, t;
 	long max_cycles = 1, cycle_count = 1;
-	fd_set select_stdin;
 	uint8_t cmdexit;
-	struct timeval tosleep;
+	struct watch_output current_output = {0}, next_output = {0};
+	bool use_prev_diff = false;
 	bool sleep_dontsleep, sleep_scrdumped, sleep_exit;
         WINDOW *hdrwin = NULL;
 	const struct option longopts[] = {
@@ -1243,8 +1398,12 @@ int main(int argc, char *argv[])
 			break;
 		case 'd':
 			flags |= WATCH_DIFF;
-			if (optarg)
-				flags |= WATCH_CUMUL;
+			if (optarg) {
+				if (strcmp(optarg, "d") == 0)
+					flags |= WATCH_PREVIEW;
+				else
+					flags |= WATCH_CUMUL;
+			}
 			break;
 		case 'e':
 			flags |= WATCH_ERREXIT;
@@ -1329,9 +1488,9 @@ int main(int argc, char *argv[])
 	if (interval_real > 60L * 60 * 24 * 31)
 		interval_real = 60L * 60 * 24 * 31;
 	interval = (long double)interval_real * USECS_PER_SEC;
+	half_interval = interval / 2;
+	use_prev_diff = (flags & WATCH_PREVIEW) && (flags & WATCH_DIFF);
 	tzset();
-
-	FD_ZERO(&select_stdin);
 
 	// Catch keyboard interrupts so we can put tty back in a sane state.
 	signal(SIGINT, die);
@@ -1367,11 +1526,11 @@ int main(int argc, char *argv[])
 		set_ansi_attribute(-1, NULL);
 		if (screen_size_changed) {
 			screen_size_changed = false;  // "atomic" test-and-set
-                        endwin();
-                        refresh();
-                        getmaxyx(stdscr, height, width);
-                        resizeterm(height, width);
-                        wresize(mainwin, MAIN_HEIGHT, width);
+			endwin();
+			refresh();
+			getmaxyx(stdscr, height, width);
+			resizeterm(height, width);
+			wresize(mainwin, MAIN_HEIGHT, width);
 			first_screen = true;
 		}
 
@@ -1380,7 +1539,10 @@ int main(int argc, char *argv[])
 		t = get_time_usec();
 		if (flags & WATCH_PRECISE)
 			last_tick = t;
-		cmdexit = run_command();
+		if (use_prev_diff)
+			cmdexit = run_command_capture(&next_output);
+		else
+			cmdexit = run_command();
 		if (flags & WATCH_PRECISE)
 			output_lowheader(hdrwin, get_time_usec() - t, cmdexit);
 		else {
@@ -1388,6 +1550,28 @@ int main(int argc, char *argv[])
 			output_lowheader(hdrwin, last_tick - t, cmdexit);
 		}
 		wrefresh(hdrwin);
+
+		sleep_dontsleep = sleep_scrdumped = sleep_exit = false;
+		bool rendered_new = true;
+		if (use_prev_diff) {
+			if (first_screen) {
+				screen_changed = false;
+				(void)!render_buffer(&next_output, true);
+				replace_output(&current_output, &next_output);
+			} else {
+				render_prev_diff_transition(&current_output, &next_output, true);
+				wrefresh(mainwin);
+				sleep_dontsleep = wait_until(last_tick + half_interval, &sleep_scrdumped, &sleep_exit);
+				if (sleep_exit)
+					break;
+				if (!sleep_dontsleep) {
+					render_prev_diff_transition(&current_output, &next_output, false);
+					replace_output(&current_output, &next_output);
+				} else {
+					rendered_new = false;
+				}
+			}
+		}
 
 		if (cmdexit) {
 			if (flags & WATCH_BEEP)
@@ -1410,7 +1594,7 @@ int main(int argc, char *argv[])
 		// [BUG] When screen resizes, its contents change, but not
 		// necessarily because cmd output's changed. It may have, but that
 		// event is lost. Prevents cycle_count from soaring while resizing.
-		if (! first_screen) {
+		if (! first_screen && rendered_new) {
 			if (flags & WATCH_CHGEXIT && screen_changed)
 				break;
 			if (flags & WATCH_EQUEXIT) {
@@ -1425,47 +1609,16 @@ int main(int argc, char *argv[])
 		}
 
 		wrefresh(mainwin);  // takes some time
-		first_screen = false;
-
-		// first process all available input, then respond to
-		// screen_size_changed, then sleep
-		sleep_dontsleep = sleep_scrdumped = sleep_exit = false;
-		do {
-			assert(FD_SETSIZE > STDIN_FILENO);
-			FD_SET(STDIN_FILENO, &select_stdin);
-			sleep_dontsleep |= screen_size_changed && ! (flags & WATCH_NORERUN);
-			if (! sleep_dontsleep && (t=get_time_usec()-last_tick) < interval) {
-				tosleep.tv_sec = (interval-t) / USECS_PER_SEC;
-				tosleep.tv_usec = (interval-t) % USECS_PER_SEC;
-			}
-			else memset(&tosleep, 0, sizeof(tosleep));
-			i = select(STDIN_FILENO+1, &select_stdin, NULL, NULL, &tosleep);
-			assert(i != -1 || errno == EINTR);
-			if (i > 0) {
-				// all keys idempotent
-				switch (getchar()) {
-				case EOF:
-					if (errno != EINTR)
-						endwin_xerr(1, "getchar()");
-					break;
-				case 'q':
-					sleep_dontsleep = sleep_exit = true;
-					break;
-				case ' ':
-					sleep_dontsleep = true;
-					break;
-				case 's':
-					if (! sleep_scrdumped) {
-						screenshot();
-						sleep_scrdumped = true;
-					}
-					break;
-				}
-			}
-		} while (i);
+		if (rendered_new)
+			first_screen = false;
+		if (sleep_dontsleep)
+			continue;
+		sleep_dontsleep = wait_until(last_tick + interval, &sleep_scrdumped, &sleep_exit);
 		if (sleep_exit)
 			break;
 	}
 
+	free(current_output.buf);
+	free(next_output.buf);
 	endwin_exit(EXIT_SUCCESS);
 }

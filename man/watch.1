@@ -43,6 +43,10 @@ Highlight the differences between successive updates. If the optional
 \fIpermanent\fR argument is specified then \fBwatch\fR will show all changes
 since the first iteration. The \fIpermanent\fR argument needs to be linked to
 the option, such as \fB\-d1\fR or \fB\-\-differences=1\fR.
+If \fB\-d\fR is specified twice (e.g. \fB\-dd\fR), \fBwatch\fR will first
+highlight the characters that are about to change for the first half of the
+interval, then show the new output with the same highlights for the second
+half.
 .TP
 \fB\-e\fR, \fB\-\-errexit\fR
 Freeze updates on \fIcommand\fR error, and exit after a key press. The exit code
