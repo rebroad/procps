@@ -353,6 +353,7 @@ static void ansi_write_line(int row, const char *line)
 			(void)!write(STDOUT_FILENO, line, strlen(line));
 		}
 	}
+	(void)!write(STDOUT_FILENO, "\x1b[49m", 5); // ensure default background before clear
 	(void)!write(STDOUT_FILENO, "\x1b[K", 3); // clear to end of line
 }
 
