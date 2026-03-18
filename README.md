@@ -30,6 +30,17 @@ The following utilities are provided by procps:
 * *w* - Report logged in users and what they are doing
 * *watch* - Execute a program periodically, showing output fullscreen
 
+## Build Notes
+Some distributions enable extra configure flags that can affect runtime
+behavior (for example, `watch` formatting). If you want Debian-like
+defaults on Debian/Ubuntu, run:
+
+```
+./autogen.sh
+./scripts/configure-debian.sh
+make
+```
+
 ## Reporting Bugs
 There are three ways to submit bugs or feature requests:
 
