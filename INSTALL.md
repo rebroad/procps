@@ -16,6 +16,20 @@ The configure script has a lot of options, so please have a read
 of `configure --help` to see what they are and what they are used
 for.
 
+Debian-Style Build Flags
+------------------------
+Some distributions (such as Debian) enable additional build flags that
+can affect behavior of tools like `watch`. To match Debian's defaults,
+run:
+
+    ./autogen.sh
+    ./scripts/configure-debian.sh
+    make
+    make install
+
+This script uses `dpkg-architecture` and is intended for Debian/Ubuntu
+systems.
+
 Testing
 -------
 procps has a series of test scripts (and more are welcome if they
